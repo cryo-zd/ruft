@@ -1,0 +1,24 @@
+[package]
+name = "ruft"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A deterministic runtime-agnostic Raft core"
+keywords = ["raft", "consensus", "distributed-systems"]
+categories = ["algorithms", "network-programming"]
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde", "serde/rc"]
+testing = ["dep:proptest"]
+
+[dependencies]
+proptest = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
