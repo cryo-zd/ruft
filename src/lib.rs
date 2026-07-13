@@ -9,10 +9,16 @@
 
 mod config;
 mod error;
+mod log;
+mod recovery_error;
+mod state;
 mod types;
 
 pub use config::{Config, ConfigBuilder};
 pub use error::{ArithmeticError, InitError};
+pub use log::{Entry, EntryPayload, RaftLog};
+pub use recovery_error::{EntryError, LogError, RecoveryError};
+pub use state::{HardState, RecoveredState, SnapshotRecord};
 pub use types::{
     ClusterId, EffectId, LogIndex, NodeId, ProposalId, ReadId, SnapshotDigest, SnapshotId,
     SnapshotMetadata, SnapshotRef, Term,
