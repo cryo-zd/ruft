@@ -25,6 +25,11 @@ pub struct PersistBatch<C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Effect<C> {
+    /// Sends one Raft RPC through the host transport.
+    SendMessage {
+        to: NodeId,
+        message: crate::Message<C>,
+    },
     /// Persists a Raft batch before dependent protocol actions proceed.
     Persist {
         id: crate::EffectId,

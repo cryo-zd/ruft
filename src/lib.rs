@@ -13,13 +13,15 @@ mod effect;
 mod error;
 mod event;
 mod log;
+mod progress;
 mod protocol;
+mod raft;
 mod recovery_error;
 mod state;
 mod types;
 
 pub use config::{Config, ConfigBuilder};
-pub use core::{InputError, RaftCore, Status, StepError, StepOutput};
+pub use core::{InputError, RaftCore, Role, Status, StepError, StepOutput};
 pub use effect::{Effect, EffectOutcome, PersistBatch};
 pub use error::{ArithmeticError, InitError};
 pub use event::{Event, TickKind};

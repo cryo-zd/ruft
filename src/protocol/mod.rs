@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use crate::{ClusterId, Entry, NodeId, SnapshotMetadata, Term};
+use crate::{ClusterId, Entry, LogIndex, NodeId, SnapshotMetadata, Term};
 
 /// A message bound to one Raft group and an intended recipient.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,9 +48,21 @@ pub enum Message<C> {
     /// A heartbeat with no log entries.
     Heartbeat,
     /// A pre-election request for the supplied prospective term.
-    PreVote { term: Term },
+    PreVote {
+        term: Term,
+        last_log_index: LogIndex,
+        last_log_term: Term,
+    },
     /// A durable vote request for the supplied term.
-    RequestVote { term: Term },
+    RequestVote {
+        term: Term,
+        last_log_index: LogIndex,
+        last_log_term: Term,
+    },
+    /// A response to a pre-election request.
+    PreVoteResponse { term: Term, granted: bool },
+    /// A response to a durable vote request.
+    VoteResponse { term: Term, granted: bool },
     /// A log replication request.
     AppendEntries { term: Term, entries: Vec<Entry<C>> },
     /// A snapshot transfer metadata message.
