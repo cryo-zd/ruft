@@ -8,15 +8,23 @@
 #![warn(missing_docs)]
 
 mod config;
+mod core;
+mod effect;
 mod error;
+mod event;
 mod log;
+mod protocol;
 mod recovery_error;
 mod state;
 mod types;
 
 pub use config::{Config, ConfigBuilder};
+pub use core::{InputError, RaftCore, Status, StepError, StepOutput};
+pub use effect::{Effect, EffectOutcome, PersistBatch};
 pub use error::{ArithmeticError, InitError};
+pub use event::{Event, TickKind};
 pub use log::{Entry, EntryPayload, RaftLog};
+pub use protocol::{Envelope, Message};
 pub use recovery_error::{EntryError, LogError, RecoveryError};
 pub use state::{HardState, RecoveredState, SnapshotRecord};
 pub use types::{
