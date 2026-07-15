@@ -22,7 +22,7 @@ mod types;
 
 pub use config::{Config, ConfigBuilder};
 pub use core::{InputError, RaftCore, Role, Status, StepError, StepOutput};
-pub use effect::{Effect, EffectOutcome, PersistBatch};
+pub use effect::{Effect, EffectOutcome, PersistBatch, ProposalResult};
 pub use error::{ArithmeticError, InitError};
 pub use event::{Event, TickKind};
 pub use log::{Entry, EntryPayload, RaftLog};
