@@ -54,7 +54,6 @@ impl Progress {
         self.state
     }
     /// Returns the number of requests awaiting acknowledgement.
-    /// Returns the number of requests awaiting acknowledgement.
     pub fn inflight_count(&self) -> usize {
         self.inflights.len()
     }
