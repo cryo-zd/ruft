@@ -58,6 +58,51 @@ impl<C> RaftLog<C> {
         self.committed
     }
 
+    /// Advances the commit point without allowing it to exceed the local log.
+    pub fn commit_to(&mut self, index: LogIndex) -> Result<(), LogError> {
+        if index > self.last_index() {
+            return Err(LogError::Unavailable {
+                index,
+                last: self.last_index(),
+            });
+        }
+        if index > self.committed {
+            self.committed = index;
+        }
+        Ok(())
+    }
+
+    /// Returns the first local index stored with `term`.
+    pub fn first_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.metadata().term() == term)
+        {
+            return self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.metadata().index());
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.term() == term)
+            .map(Entry::index)
+    }
+
+    /// Merges a leader suffix and returns only entries that require durability.
+    pub fn merge_from_leader(&mut self, incoming: &[Entry<C>]) -> Result<Vec<Entry<C>>, LogError> {
+        let Some(first_change) = incoming.iter().position(|entry| {
+            self.term(entry.index())
+                .map_or(true, |term| term != entry.term())
+        }) else {
+            return Ok(Vec::new());
+        };
+        let new_entries = incoming[first_change..].to_vec();
+        self.replace_conflict(new_entries.clone())?;
+        Ok(new_entries)
+    }
+
     /// Returns the first entry still waiting for persistence confirmation.
     pub const fn unstable_from(&self) -> Option<LogIndex> {
         self.unstable.from()

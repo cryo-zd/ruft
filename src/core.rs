@@ -6,8 +6,9 @@ use std::collections::BTreeSet;
 
 use crate::progress::QuorumTracker;
 use crate::{
-    Config, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogIndex, Message,
-    PersistBatch, RecoveredState, Term, raft::is_log_up_to_date,
+    Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogError,
+    LogIndex, Message, PersistBatch, RaftLog, RecoveredState, Term,
+    raft::{PrefixDecision, is_log_up_to_date, validate_prefix},
 };
 
 /// The local node role in the fixed-membership Raft election protocol.
@@ -59,6 +60,7 @@ pub enum InputError {
 pub enum StepError {
     Input(InputError),
     Arithmetic(crate::ArithmeticError),
+    Log(LogError),
     PersistenceFailed,
     Stopped,
 }
@@ -78,11 +80,18 @@ enum PersistContinuation {
         granted: bool,
     },
     ActivateLeader,
+    SendAppendEntriesResponse {
+        to: crate::NodeId,
+        term: Term,
+        success: bool,
+        conflict: Option<ConflictHint>,
+    },
     None,
 }
 
 struct PendingPersist {
     id: EffectId,
+    stable_through: Option<LogIndex>,
     continuation: PersistContinuation,
 }
 
@@ -91,6 +100,7 @@ pub struct RaftCore<C> {
     config: Config,
     hard_state: HardState,
     role: Role,
+    log: RaftLog<C>,
     last_log_index: LogIndex,
     last_log_term: Term,
     pre_votes: Option<QuorumTracker>,
@@ -106,6 +116,7 @@ impl<C> RaftCore<C> {
     /// Restores a core from state that has already passed recovery validation.
     pub fn new(config: Config, recovered: RecoveredState<C>) -> Result<Self, crate::InitError> {
         let hard_state = recovered.hard_state().clone();
+        let log = RaftLog::from_recovered(&recovered);
         let (last_log_index, last_log_term) = recovered.entries().last().map_or_else(
             || {
                 recovered
@@ -120,6 +131,7 @@ impl<C> RaftCore<C> {
             config,
             hard_state,
             role: Role::Follower,
+            log,
             last_log_index,
             last_log_term,
             pre_votes: None,
@@ -205,12 +217,97 @@ impl<C> RaftCore<C> {
             Message::VoteResponse { term, granted } => {
                 self.on_vote_response(from, *term, *granted, effects)?
             }
-            Message::AppendEntries { term, .. } | Message::InstallSnapshot { term, .. } => {
+            Message::AppendEntries { .. } => self.on_append_entries(from, message, effects)?,
+            Message::InstallSnapshot { term, .. } => {
                 if *term > self.hard_state.current_term() {
                     self.begin_term_transition(*term, PersistContinuation::None, effects)?;
                 }
             }
-            Message::Heartbeat => {}
+            Message::AppendEntriesResponse { .. } | Message::Heartbeat => {}
+        }
+        Ok(())
+    }
+
+    fn on_append_entries(
+        &mut self,
+        from: crate::NodeId,
+        message: &Message<C>,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        let Message::AppendEntries {
+            term,
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            entries,
+        } = message
+        else {
+            return Ok(());
+        };
+        let term = *term;
+        let prev_log_index = *prev_log_index;
+        let prev_log_term = *prev_log_term;
+        let leader_commit = *leader_commit;
+        let current_term = self.hard_state.current_term();
+        if term < current_term {
+            self.send_append_entries_response(from, current_term, false, None, effects);
+            return Ok(());
+        }
+
+        self.become_follower();
+        let term_changed = term > current_term;
+        let decision =
+            validate_prefix(&self.log, prev_log_index, prev_log_term).map_err(StepError::Log)?;
+        let (success, conflict, appended) = match decision {
+            PrefixDecision::Reject(conflict) => (false, Some(conflict), Vec::new()),
+            PrefixDecision::Match => {
+                let appended = self
+                    .log
+                    .merge_from_leader(entries)
+                    .map_err(StepError::Log)?;
+                let commit = core::cmp::min(leader_commit, self.log.last_index());
+                self.log.commit_to(commit).map_err(StepError::Log)?;
+                self.last_log_index = self.log.last_index();
+                self.last_log_term = self.log.term(self.last_log_index).map_err(StepError::Log)?;
+                (true, None, appended)
+            }
+        };
+
+        let commit_changed = self.hard_state.commit_index() != self.log.committed_index();
+        if term_changed || commit_changed {
+            self.hard_state = HardState::new(
+                term,
+                if term_changed {
+                    None
+                } else {
+                    self.hard_state.voted_for()
+                },
+                self.log.committed_index(),
+            );
+        }
+        if term_changed || commit_changed || !appended.is_empty() {
+            self.queue_persist(
+                PersistBatch {
+                    hard_state: (term_changed || commit_changed).then(|| self.hard_state.clone()),
+                    entries: appended,
+                    snapshot: None,
+                },
+                PersistContinuation::SendAppendEntriesResponse {
+                    to: from,
+                    term: self.hard_state.current_term(),
+                    success,
+                    conflict,
+                },
+                effects,
+            )?;
+        } else {
+            self.send_append_entries_response(
+                from,
+                self.hard_state.current_term(),
+                success,
+                conflict,
+                effects,
+            );
         }
         Ok(())
     }
@@ -400,6 +497,9 @@ impl<C> RaftCore<C> {
             .map_err(StepError::Arithmetic)?;
         let entry = Entry::leader_noop(index, self.hard_state.current_term())
             .expect("checked Raft index and nonzero elected term");
+        self.log
+            .append(vec![entry.clone()])
+            .map_err(StepError::Log)?;
         self.last_log_index = index;
         self.last_log_term = self.hard_state.current_term();
         self.queue_persist(
@@ -446,7 +546,12 @@ impl<C> RaftCore<C> {
         effects: &mut Vec<Effect<C>>,
     ) -> Result<(), StepError> {
         let id = self.next_effect_id()?;
-        self.pending_persist = Some(PendingPersist { id, continuation });
+        let stable_through = batch.entries.last().map(Entry::index);
+        self.pending_persist = Some(PendingPersist {
+            id,
+            stable_through,
+            continuation,
+        });
         effects.push(Effect::Persist { id, batch });
         Ok(())
     }
@@ -475,6 +580,9 @@ impl<C> RaftCore<C> {
             self.pending_persist = Some(pending);
             return Err(StepError::Input(InputError::InvalidEffectOutcome));
         }
+        if let Some(index) = pending.stable_through {
+            self.log.mark_stable(index).map_err(StepError::Log)?;
+        }
         match pending.continuation {
             PersistContinuation::BroadcastVoteRequests => {
                 if self.votes.as_ref().is_some_and(QuorumTracker::has_quorum) {
@@ -486,6 +594,12 @@ impl<C> RaftCore<C> {
             PersistContinuation::SendVoteResponse { to, term, granted } => {
                 self.send_vote_response(to, term, granted, effects)
             }
+            PersistContinuation::SendAppendEntriesResponse {
+                to,
+                term,
+                success,
+                conflict,
+            } => self.send_append_entries_response(to, term, success, conflict, effects),
             PersistContinuation::ActivateLeader => {
                 self.role = Role::Leader;
                 self.votes = None;
@@ -563,6 +677,24 @@ impl<C> RaftCore<C> {
             message: Message::PreVoteResponse {
                 term: self.hard_state.current_term(),
                 granted,
+            },
+        });
+    }
+
+    fn send_append_entries_response(
+        &self,
+        to: crate::NodeId,
+        term: Term,
+        success: bool,
+        conflict: Option<ConflictHint>,
+        effects: &mut Vec<Effect<C>>,
+    ) {
+        effects.push(Effect::SendMessage {
+            to,
+            message: Message::AppendEntriesResponse {
+                term,
+                success,
+                conflict,
             },
         });
     }
