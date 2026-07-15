@@ -84,7 +84,7 @@ fn follower_replies_success_only_after_entries_are_durable() {
         .unwrap()
         .effects;
     assert!(
-        matches!(effects.as_slice(), [Effect::SendMessage { to, message: Message::AppendEntriesResponse { term: Term(1), success: true, conflict: None } }] if *to == NodeId::new(1))
+        matches!(effects.as_slice(), [Effect::SendMessage { to, message: Message::AppendEntriesResponse { term: Term(1), success: true, conflict: None, .. } }] if *to == NodeId::new(1))
     );
 }
 
@@ -219,7 +219,8 @@ fn stale_leader_term_is_rejected_without_persistence() {
             message: Message::AppendEntriesResponse {
                 term: Term(2),
                 success: false,
-                conflict: None
+                conflict: None,
+                ..
             },
             ..
         }]

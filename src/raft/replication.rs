@@ -38,3 +38,15 @@ pub(crate) fn validate_prefix<C>(
         Err(error) => Err(error),
     }
 }
+
+/// Chooses the next leader probe index after a follower rejection.
+pub(crate) fn rejected_next<C>(log: &RaftLog<C>, hint: ConflictHint) -> Result<LogIndex, LogError> {
+    if let Some(term) = hint.term {
+        if let Some(index) = log.last_index_of_term(term) {
+            return index
+                .checked_next()
+                .map_err(|_| LogError::IndexOverflow { at: index });
+        }
+    }
+    Ok(hint.index)
+}
