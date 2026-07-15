@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::progress::{Progress, QuorumTracker};
 use crate::{
     Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogError,
-    LogIndex, Message, PersistBatch, RaftLog, RecoveredState, Term,
-    raft::{PrefixDecision, is_log_up_to_date, rejected_next, validate_prefix},
+    LogIndex, Message, PersistBatch, ProposalId, ProposalResult, RaftLog, RecoveredState, Term,
+    raft::{PrefixDecision, is_log_up_to_date, quorum_commit, rejected_next, validate_prefix},
 };
 
 /// The local node role in the fixed-membership Raft election protocol.
@@ -61,6 +61,8 @@ pub enum StepError {
     Input(InputError),
     Arithmetic(crate::ArithmeticError),
     Log(LogError),
+    Entry(crate::EntryError),
+    ApplyFailed,
     PersistenceFailed,
     Stopped,
 }
@@ -87,7 +89,14 @@ enum PersistContinuation {
         conflict: Option<ConflictHint>,
         match_index: LogIndex,
     },
+    ReplicateProposal,
+    ApplyCommitted,
     None,
+}
+
+struct PendingApply {
+    id: EffectId,
+    through: LogIndex,
 }
 
 struct PendingPersist {
@@ -109,6 +118,9 @@ pub struct RaftCore<C> {
     active_members: BTreeSet<crate::NodeId>,
     progress: BTreeMap<crate::NodeId, Progress>,
     pending_persist: Option<PendingPersist>,
+    pending_apply: Option<PendingApply>,
+    applied_index: LogIndex,
+    proposals: BTreeMap<LogIndex, Vec<ProposalId>>,
     next_effect_sequence: u64,
     stopped: bool,
     _command: core::marker::PhantomData<C>,
@@ -141,6 +153,11 @@ impl<C> RaftCore<C> {
             active_members: BTreeSet::new(),
             progress: BTreeMap::new(),
             pending_persist: None,
+            pending_apply: None,
+            applied_index: recovered
+                .snapshot()
+                .map_or(LogIndex::new(0), |snapshot| snapshot.metadata().index()),
+            proposals: BTreeMap::new(),
             next_effect_sequence: 0,
             stopped: false,
             _command: core::marker::PhantomData,
@@ -168,7 +185,16 @@ impl<C> RaftCore<C> {
                 self.on_effect_completed(id, outcome, &mut effects)?
             }
             Event::Shutdown => self.stopped = true,
-            Event::Propose { .. } | Event::Read { .. } => {}
+            Event::Propose {
+                proposal_id,
+                command,
+                encoded_len,
+            } => self.on_propose(proposal_id, command, encoded_len, &mut effects)?,
+            Event::Read { .. } => {}
+        }
+        self.emit_apply_if_needed(&mut effects)?;
+        if previous_role == Role::Leader && self.role != Role::Leader {
+            self.fail_uncommitted_proposals(&mut effects);
         }
         Ok(StepOutput {
             effects,
@@ -189,6 +215,50 @@ impl<C> RaftCore<C> {
             role: self.role,
             stopped: self.stopped,
         }
+    }
+
+    fn on_propose(
+        &mut self,
+        proposal_id: ProposalId,
+        command: C,
+        encoded_len: usize,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        if self.role != Role::Leader {
+            effects.push(Effect::ProposalResult {
+                proposal_id,
+                result: ProposalResult::LeadershipLost,
+            });
+            return Ok(());
+        }
+        if self.pending_persist.is_some() || encoded_len > self.config.max_bytes_per_rpc() {
+            effects.push(Effect::ProposalResult {
+                proposal_id,
+                result: ProposalResult::Rejected,
+            });
+            return Ok(());
+        }
+        let index = self
+            .last_log_index
+            .checked_next()
+            .map_err(StepError::Arithmetic)?;
+        let entry = Entry::command(index, self.hard_state.current_term(), command, encoded_len)
+            .map_err(StepError::Entry)?;
+        self.log
+            .append(vec![entry.clone()])
+            .map_err(StepError::Log)?;
+        self.last_log_index = index;
+        self.last_log_term = self.hard_state.current_term();
+        self.proposals.entry(index).or_default().push(proposal_id);
+        self.queue_persist(
+            PersistBatch {
+                hard_state: None,
+                entries: vec![entry],
+                snapshot: None,
+            },
+            PersistContinuation::ReplicateProposal,
+            effects,
+        )
     }
 
     fn on_message(
@@ -385,8 +455,40 @@ impl<C> RaftCore<C> {
         };
         if changed {
             self.replicate_to(from, effects)?;
+            self.advance_commit(effects)?;
         }
         Ok(())
+    }
+
+    fn advance_commit(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        if self.pending_persist.is_some() {
+            return Ok(());
+        }
+        let Some(commit) = quorum_commit(
+            &self.log,
+            &self.progress,
+            self.config.quorum(),
+            self.hard_state.current_term(),
+        )
+        .map_err(StepError::Log)?
+        else {
+            return Ok(());
+        };
+        self.log.commit_to(commit).map_err(StepError::Log)?;
+        self.hard_state = HardState::new(
+            self.hard_state.current_term(),
+            self.hard_state.voted_for(),
+            commit,
+        );
+        self.queue_persist(
+            PersistBatch {
+                hard_state: Some(self.hard_state.clone()),
+                entries: Vec::new(),
+                snapshot: None,
+            },
+            PersistContinuation::ApplyCommitted,
+            effects,
+        )
     }
 
     fn on_vote_request(
@@ -637,6 +739,69 @@ impl<C> RaftCore<C> {
         Ok(())
     }
 
+    fn emit_apply_if_needed(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        if self.pending_persist.is_some()
+            || self.pending_apply.is_some()
+            || self.applied_index >= self.hard_state.commit_index()
+        {
+            return Ok(());
+        }
+        let from = self
+            .applied_index
+            .checked_next()
+            .map_err(StepError::Arithmetic)?;
+        let through = self.hard_state.commit_index();
+        let entries = self
+            .log
+            .entries(from..=through)
+            .map_err(StepError::Log)?
+            .to_vec();
+        let id = self.next_effect_id()?;
+        self.pending_apply = Some(PendingApply { id, through });
+        effects.push(Effect::Apply { id, entries });
+        Ok(())
+    }
+
+    fn finish_apply(&mut self, through: LogIndex, effects: &mut Vec<Effect<C>>) {
+        let indexes: Vec<_> = self
+            .proposals
+            .range(..=through)
+            .map(|(index, _)| *index)
+            .collect();
+        for index in indexes {
+            if let Some(ids) = self.proposals.remove(&index) {
+                for proposal_id in ids {
+                    effects.push(Effect::ProposalResult {
+                        proposal_id,
+                        result: ProposalResult::Applied { index },
+                    });
+                }
+            }
+        }
+    }
+
+    fn fail_uncommitted_proposals(&mut self, effects: &mut Vec<Effect<C>>) {
+        let committed = self.hard_state.commit_index();
+        let indexes: Vec<_> = self
+            .proposals
+            .range((
+                core::ops::Bound::Excluded(committed),
+                core::ops::Bound::Unbounded,
+            ))
+            .map(|(index, _)| *index)
+            .collect();
+        for index in indexes {
+            if let Some(ids) = self.proposals.remove(&index) {
+                for proposal_id in ids {
+                    effects.push(Effect::ProposalResult {
+                        proposal_id,
+                        result: ProposalResult::LeadershipLost,
+                    });
+                }
+            }
+        }
+    }
+
     fn on_effect_completed(
         &mut self,
         id: EffectId,
@@ -645,6 +810,28 @@ impl<C> RaftCore<C> {
     ) -> Result<(), StepError> {
         if id.generation() != self.config.generation() {
             return Err(StepError::Input(InputError::StaleEffectGeneration));
+        }
+        if let Some(pending) = self.pending_apply.take() {
+            if pending.id != id {
+                self.pending_apply = Some(pending);
+                return Err(StepError::Input(InputError::UnknownEffect));
+            }
+            match outcome {
+                EffectOutcome::Applied { through } if through == pending.through => {
+                    self.applied_index = through;
+                    self.finish_apply(through, effects);
+                    self.emit_apply_if_needed(effects)?;
+                    return Ok(());
+                }
+                EffectOutcome::Failed => {
+                    self.stopped = true;
+                    return Err(StepError::ApplyFailed);
+                }
+                _ => {
+                    self.pending_apply = Some(pending);
+                    return Err(StepError::Input(InputError::InvalidEffectOutcome));
+                }
+            }
         }
         let Some(pending) = self.pending_persist.take() else {
             return Err(StepError::Input(InputError::UnknownEffect));
@@ -682,8 +869,21 @@ impl<C> RaftCore<C> {
                 conflict,
                 match_index,
             } => {
-                self.send_append_entries_response(to, term, success, conflict, match_index, effects)
+                self.send_append_entries_response(
+                    to,
+                    term,
+                    success,
+                    conflict,
+                    match_index,
+                    effects,
+                );
+                self.emit_apply_if_needed(effects)?;
             }
+            PersistContinuation::ReplicateProposal => {
+                self.replicate_all(effects)?;
+                self.advance_commit(effects)?;
+            }
+            PersistContinuation::ApplyCommitted => self.emit_apply_if_needed(effects)?,
             PersistContinuation::ActivateLeader => {
                 self.role = Role::Leader;
                 self.votes = None;
@@ -691,6 +891,7 @@ impl<C> RaftCore<C> {
                 self.active_members.insert(self.config.local_id());
                 self.initialize_progress();
                 self.replicate_all(effects)?;
+                self.advance_commit(effects)?;
             }
             PersistContinuation::None => {}
         }

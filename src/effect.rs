@@ -2,7 +2,18 @@
 
 #![allow(missing_docs)]
 
-use crate::{Entry, HardState, LogIndex, NodeId, SnapshotRecord};
+use crate::{Entry, HardState, LogIndex, NodeId, ProposalId, SnapshotRecord};
+
+/// The terminal outcome for one host proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalResult {
+    /// The proposal command was applied through its log index.
+    Applied { index: LogIndex },
+    /// The proposal was not committed before local leadership ended.
+    LeadershipLost,
+    /// The core could not accept the proposal at this time.
+    Rejected,
+}
 
 /// Result reported after an asynchronous effect completes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +45,11 @@ pub enum Effect<C> {
     Persist {
         id: crate::EffectId,
         batch: PersistBatch<C>,
+    },
+    /// Reports a terminal host proposal outcome.
+    ProposalResult {
+        proposal_id: ProposalId,
+        result: ProposalResult,
     },
     /// Applies committed entries to the host state machine.
     Apply {
