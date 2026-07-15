@@ -72,6 +72,20 @@ impl<C> RaftLog<C> {
         Ok(())
     }
 
+    /// Returns the last local index stored with `term`.
+    pub fn last_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.term() == term)
+            .map(Entry::index)
+            .or_else(|| {
+                self.snapshot.as_ref().and_then(|snapshot| {
+                    (snapshot.metadata().term() == term).then(|| snapshot.metadata().index())
+                })
+            })
+    }
+
     /// Returns the first local index stored with `term`.
     pub fn first_index_of_term(&self, term: Term) -> Option<LogIndex> {
         if self

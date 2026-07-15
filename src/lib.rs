@@ -26,6 +26,7 @@ pub use effect::{Effect, EffectOutcome, PersistBatch};
 pub use error::{ArithmeticError, InitError};
 pub use event::{Event, TickKind};
 pub use log::{Entry, EntryPayload, RaftLog};
+pub use progress::{Progress, ProgressState};
 pub use protocol::{ConflictHint, Envelope, Message};
 pub use recovery_error::{EntryError, LogError, RecoveryError};
 pub use state::{HardState, RecoveredState, SnapshotRecord};

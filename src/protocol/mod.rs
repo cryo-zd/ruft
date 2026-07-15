@@ -91,6 +91,7 @@ pub enum Message<C> {
     AppendEntriesResponse {
         term: Term,
         success: bool,
+        match_index: LogIndex,
         conflict: Option<ConflictHint>,
     },
     /// A snapshot transfer metadata message.

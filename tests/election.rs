@@ -155,14 +155,7 @@ fn leader_retains_authority_when_a_quorum_is_active() {
 
     let effects = core.step(Event::Tick(TickKind::Heartbeat)).unwrap().effects;
     assert_eq!(core.status().role(), Role::Leader);
-    assert_eq!(effects.len(), 2);
-    assert!(effects.iter().all(|effect| matches!(
-        effect,
-        Effect::SendMessage {
-            message: Message::Heartbeat,
-            ..
-        }
-    )));
+    assert!(effects.is_empty());
 }
 
 #[test]

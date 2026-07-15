@@ -2,13 +2,13 @@
 
 #![allow(missing_docs)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::progress::QuorumTracker;
+use crate::progress::{Progress, QuorumTracker};
 use crate::{
     Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogError,
     LogIndex, Message, PersistBatch, RaftLog, RecoveredState, Term,
-    raft::{PrefixDecision, is_log_up_to_date, validate_prefix},
+    raft::{PrefixDecision, is_log_up_to_date, rejected_next, validate_prefix},
 };
 
 /// The local node role in the fixed-membership Raft election protocol.
@@ -85,6 +85,7 @@ enum PersistContinuation {
         term: Term,
         success: bool,
         conflict: Option<ConflictHint>,
+        match_index: LogIndex,
     },
     None,
 }
@@ -106,6 +107,7 @@ pub struct RaftCore<C> {
     pre_votes: Option<QuorumTracker>,
     votes: Option<QuorumTracker>,
     active_members: BTreeSet<crate::NodeId>,
+    progress: BTreeMap<crate::NodeId, Progress>,
     pending_persist: Option<PendingPersist>,
     next_effect_sequence: u64,
     stopped: bool,
@@ -137,6 +139,7 @@ impl<C> RaftCore<C> {
             pre_votes: None,
             votes: None,
             active_members: BTreeSet::new(),
+            progress: BTreeMap::new(),
             pending_persist: None,
             next_effect_sequence: 0,
             stopped: false,
@@ -153,7 +156,7 @@ impl<C> RaftCore<C> {
         let mut effects = Vec::new();
         match event {
             Event::Tick(crate::TickKind::Election) => self.start_pre_vote(&mut effects)?,
-            Event::Tick(crate::TickKind::Heartbeat) => self.on_heartbeat_tick(&mut effects),
+            Event::Tick(crate::TickKind::Heartbeat) => self.on_heartbeat_tick(&mut effects)?,
             Event::MessageReceived(envelope) => {
                 self.validate_envelope(&envelope)?;
                 if self.role == Role::Leader {
@@ -171,6 +174,11 @@ impl<C> RaftCore<C> {
             effects,
             soft_state_changed: previous_role != self.role,
         })
+    }
+
+    /// Returns leader-side progress for one remote member, when this node is leader.
+    pub fn progress(&self, node: crate::NodeId) -> Option<&Progress> {
+        self.progress.get(&node)
     }
 
     /// Returns a snapshot of local volatile election state.
@@ -223,7 +231,20 @@ impl<C> RaftCore<C> {
                     self.begin_term_transition(*term, PersistContinuation::None, effects)?;
                 }
             }
-            Message::AppendEntriesResponse { .. } | Message::Heartbeat => {}
+            Message::AppendEntriesResponse {
+                term,
+                success,
+                match_index,
+                conflict,
+            } => self.on_append_entries_response(
+                from,
+                *term,
+                *success,
+                *match_index,
+                *conflict,
+                effects,
+            )?,
+            Message::Heartbeat => {}
         }
         Ok(())
     }
@@ -250,7 +271,14 @@ impl<C> RaftCore<C> {
         let leader_commit = *leader_commit;
         let current_term = self.hard_state.current_term();
         if term < current_term {
-            self.send_append_entries_response(from, current_term, false, None, effects);
+            self.send_append_entries_response(
+                from,
+                current_term,
+                false,
+                None,
+                prev_log_index,
+                effects,
+            );
             return Ok(());
         }
 
@@ -297,6 +325,11 @@ impl<C> RaftCore<C> {
                     term: self.hard_state.current_term(),
                     success,
                     conflict,
+                    match_index: if success {
+                        self.log.last_index()
+                    } else {
+                        prev_log_index
+                    },
                 },
                 effects,
             )?;
@@ -306,8 +339,52 @@ impl<C> RaftCore<C> {
                 self.hard_state.current_term(),
                 success,
                 conflict,
+                if success {
+                    self.log.last_index()
+                } else {
+                    prev_log_index
+                },
                 effects,
             );
+        }
+        Ok(())
+    }
+
+    fn on_append_entries_response(
+        &mut self,
+        from: crate::NodeId,
+        term: Term,
+        success: bool,
+        match_index: LogIndex,
+        conflict: Option<ConflictHint>,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        if term > self.hard_state.current_term() {
+            return self.begin_term_transition(term, PersistContinuation::None, effects);
+        }
+        if self.role != Role::Leader || term != self.hard_state.current_term() {
+            return Ok(());
+        }
+        let next = if success {
+            None
+        } else {
+            Some(
+                rejected_next(
+                    &self.log,
+                    conflict.unwrap_or(ConflictHint::new(match_index, None)),
+                )
+                .map_err(StepError::Log)?,
+            )
+        };
+        let Some(progress) = self.progress.get_mut(&from) else {
+            return Ok(());
+        };
+        let changed = match next {
+            None => progress.acknowledged(core::cmp::min(match_index, self.log.last_index())),
+            Some(next_index) => progress.reject(match_index, next_index),
+        };
+        if changed {
+            self.replicate_to(from, effects)?;
         }
         Ok(())
     }
@@ -422,17 +499,20 @@ impl<C> RaftCore<C> {
         Ok(())
     }
 
-    fn on_heartbeat_tick(&mut self, effects: &mut Vec<Effect<C>>) {
+    fn on_heartbeat_tick(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
         if self.role != Role::Leader || self.pending_persist.is_some() {
-            return;
+            return Ok(());
         }
         if self.active_members.len() < self.config.quorum() {
             self.become_follower();
-            return;
+            return Ok(());
         }
         self.active_members.clear();
+        for progress in self.progress.values_mut() {
+            progress.reset_activity();
+        }
         self.active_members.insert(self.config.local_id());
-        self.broadcast_heartbeats(effects);
+        self.replicate_all(effects)
     }
 
     fn start_pre_vote(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
@@ -537,6 +617,7 @@ impl<C> RaftCore<C> {
         self.pre_votes = None;
         self.votes = None;
         self.active_members.clear();
+        self.progress.clear();
     }
 
     fn queue_persist(
@@ -599,13 +680,17 @@ impl<C> RaftCore<C> {
                 term,
                 success,
                 conflict,
-            } => self.send_append_entries_response(to, term, success, conflict, effects),
+                match_index,
+            } => {
+                self.send_append_entries_response(to, term, success, conflict, match_index, effects)
+            }
             PersistContinuation::ActivateLeader => {
                 self.role = Role::Leader;
                 self.votes = None;
                 self.active_members.clear();
                 self.active_members.insert(self.config.local_id());
-                self.broadcast_heartbeats(effects);
+                self.initialize_progress();
+                self.replicate_all(effects)?;
             }
             PersistContinuation::None => {}
         }
@@ -655,15 +740,97 @@ impl<C> RaftCore<C> {
         }
     }
 
-    fn broadcast_heartbeats(&self, effects: &mut Vec<Effect<C>>) {
+    fn initialize_progress(&mut self) {
+        let next = self
+            .log
+            .last_index()
+            .checked_next()
+            .expect("validated log index cannot overflow");
+        self.progress.clear();
         for node in self.config.members() {
             if *node != self.config.local_id() {
-                effects.push(Effect::SendMessage {
-                    to: *node,
-                    message: Message::Heartbeat,
-                });
+                self.progress.insert(
+                    *node,
+                    Progress::new(next, self.config.max_inflight_appends()),
+                );
             }
         }
+    }
+
+    fn replicate_all(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        let peers: Vec<_> = self.progress.keys().copied().collect();
+        for peer in peers {
+            self.replicate_to(peer, effects)?;
+        }
+        Ok(())
+    }
+
+    fn replicate_to(
+        &mut self,
+        to: crate::NodeId,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        let Some(progress) = self.progress.get(&to) else {
+            return Ok(());
+        };
+        if !progress.can_send() {
+            return Ok(());
+        }
+        let next = progress.next_index();
+        if next < self.log.first_index() {
+            self.progress
+                .get_mut(&to)
+                .expect("progress entry was checked")
+                .enter_snapshot();
+            return Ok(());
+        }
+        let prev_log_index = LogIndex::new(next.get() - 1);
+        let prev_log_term = self.log.term(prev_log_index).map_err(StepError::Log)?;
+        let entries = self.replication_batch(next)?;
+        let end_index = entries.last().map_or(prev_log_index, Entry::index);
+        let progress = self
+            .progress
+            .get_mut(&to)
+            .expect("progress entry was checked");
+        progress.sent(end_index);
+        effects.push(Effect::SendMessage {
+            to,
+            message: Message::AppendEntries {
+                term: self.hard_state.current_term(),
+                prev_log_index,
+                prev_log_term,
+                leader_commit: self.hard_state.commit_index(),
+                entries,
+            },
+        });
+        Ok(())
+    }
+
+    fn replication_batch(&self, next: LogIndex) -> Result<Vec<Entry<C>>, StepError> {
+        if next > self.log.last_index() {
+            return Ok(Vec::new());
+        }
+        let entries = self
+            .log
+            .entries(next..=self.log.last_index())
+            .map_err(StepError::Log)?;
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        for entry in entries {
+            let next_bytes = bytes.saturating_add(entry.encoded_len());
+            if !batch.is_empty()
+                && (batch.len() == self.config.max_entries_per_rpc()
+                    || next_bytes > self.config.max_bytes_per_rpc())
+            {
+                break;
+            }
+            batch.push(entry.clone());
+            bytes = next_bytes;
+            if batch.len() == self.config.max_entries_per_rpc() {
+                break;
+            }
+        }
+        Ok(batch)
     }
 
     fn send_pre_vote_response(
@@ -687,6 +854,7 @@ impl<C> RaftCore<C> {
         term: Term,
         success: bool,
         conflict: Option<ConflictHint>,
+        match_index: LogIndex,
         effects: &mut Vec<Effect<C>>,
     ) {
         effects.push(Effect::SendMessage {
@@ -695,6 +863,7 @@ impl<C> RaftCore<C> {
                 term,
                 success,
                 conflict,
+                match_index,
             },
         });
     }
