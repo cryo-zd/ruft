@@ -7,8 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::progress::{Progress, QuorumTracker};
 use crate::{
     Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogError,
-    LogIndex, Message, PersistBatch, ProposalId, ProposalResult, RaftLog, RecoveredState, Term,
-    raft::{PrefixDecision, is_log_up_to_date, quorum_commit, rejected_next, validate_prefix},
+    LogIndex, Message, PersistBatch, ProposalId, ProposalResult, RaftLog, ReadId, RecoveredState,
+    Term,
+    raft::{
+        PrefixDecision, ReadRound, is_log_up_to_date, quorum_commit, rejected_next, validate_prefix,
+    },
 };
 
 /// The local node role in the fixed-membership Raft election protocol.
@@ -74,6 +77,14 @@ pub struct StepOutput<C> {
     pub soft_state_changed: bool,
 }
 
+struct AppendResponse {
+    term: Term,
+    success: bool,
+    conflict: Option<ConflictHint>,
+    match_index: LogIndex,
+    read_context: Option<Vec<u8>>,
+}
+
 enum PersistContinuation {
     BroadcastVoteRequests,
     SendVoteResponse {
@@ -84,10 +95,7 @@ enum PersistContinuation {
     ActivateLeader,
     SendAppendEntriesResponse {
         to: crate::NodeId,
-        term: Term,
-        success: bool,
-        conflict: Option<ConflictHint>,
-        match_index: LogIndex,
+        response: AppendResponse,
     },
     ReplicateProposal,
     ApplyCommitted,
@@ -121,6 +129,10 @@ pub struct RaftCore<C> {
     pending_apply: Option<PendingApply>,
     applied_index: LogIndex,
     proposals: BTreeMap<LogIndex, Vec<ProposalId>>,
+    leader_noop_index: Option<LogIndex>,
+    pending_reads: Vec<ReadId>,
+    read_round: Option<ReadRound>,
+    next_read_context: u64,
     next_effect_sequence: u64,
     stopped: bool,
     _command: core::marker::PhantomData<C>,
@@ -158,6 +170,10 @@ impl<C> RaftCore<C> {
                 .snapshot()
                 .map_or(LogIndex::new(0), |snapshot| snapshot.metadata().index()),
             proposals: BTreeMap::new(),
+            leader_noop_index: None,
+            pending_reads: Vec::new(),
+            read_round: None,
+            next_read_context: 0,
             next_effect_sequence: 0,
             stopped: false,
             _command: core::marker::PhantomData,
@@ -190,7 +206,7 @@ impl<C> RaftCore<C> {
                 command,
                 encoded_len,
             } => self.on_propose(proposal_id, command, encoded_len, &mut effects)?,
-            Event::Read { .. } => {}
+            Event::Read { read_id, .. } => self.on_read(read_id, &mut effects)?,
         }
         self.emit_apply_if_needed(&mut effects)?;
         if previous_role == Role::Leader && self.role != Role::Leader {
@@ -261,6 +277,114 @@ impl<C> RaftCore<C> {
         )
     }
 
+    fn on_read(&mut self, read_id: ReadId, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        if self.role != Role::Leader {
+            return Ok(());
+        }
+        if self.pending_reads.len()
+            + self
+                .read_round
+                .as_ref()
+                .map_or(0, |round| round.request_count())
+            >= self.config.max_pending_reads()
+        {
+            return Ok(());
+        }
+        if !self.current_leader_noop_is_committed() {
+            self.pending_reads.push(read_id);
+            return Ok(());
+        }
+        if let Some(round) = self.read_round.as_mut() {
+            round.push(read_id);
+            return Ok(());
+        }
+        self.start_read_round(read_id, effects)
+    }
+
+    fn current_leader_noop_is_committed(&self) -> bool {
+        self.leader_noop_index
+            .is_some_and(|index| index <= self.hard_state.commit_index())
+    }
+
+    fn start_read_round(
+        &mut self,
+        read_id: ReadId,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        self.next_read_context = self
+            .next_read_context
+            .checked_add(1)
+            .ok_or(StepError::Arithmetic(crate::ArithmeticError::Overflow))?;
+        let mut context = Vec::with_capacity(16);
+        context.extend_from_slice(&self.hard_state.current_term().get().to_be_bytes());
+        context.extend_from_slice(&self.next_read_context.to_be_bytes());
+        self.read_round = Some(ReadRound::new(
+            context,
+            self.config.members(),
+            self.config.local_id(),
+            read_id,
+        ));
+        if self.read_round.as_ref().is_some_and(ReadRound::has_quorum) {
+            let round = self.read_round.as_mut().expect("round was just created");
+            round.set_safe_index(self.hard_state.commit_index());
+            self.release_read_round(effects);
+            self.start_pending_reads(effects)?;
+            return Ok(());
+        }
+        self.send_read_heartbeats(effects)
+    }
+
+    fn start_pending_reads(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        if self.role != Role::Leader
+            || !self.current_leader_noop_is_committed()
+            || self.read_round.is_some()
+            || self.pending_reads.is_empty()
+        {
+            return Ok(());
+        }
+        let read_id = self.pending_reads.remove(0);
+        self.start_read_round(read_id, effects)
+    }
+
+    fn acknowledge_read_context(
+        &mut self,
+        from: crate::NodeId,
+        context: &[u8],
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        let Some(round) = self.read_round.as_mut() else {
+            return Ok(());
+        };
+        if round.context() != context {
+            return Ok(());
+        }
+        round.acknowledge(from);
+        if round.has_quorum() && round.safe_index().is_none() {
+            round.set_safe_index(self.hard_state.commit_index());
+        }
+        self.release_read_round(effects);
+        self.start_pending_reads(effects)
+    }
+
+    fn release_read_round(&mut self, effects: &mut Vec<Effect<C>>) {
+        let ready = self
+            .read_round
+            .as_ref()
+            .and_then(ReadRound::safe_index)
+            .is_some_and(|index| self.applied_index >= index);
+        if !ready {
+            return;
+        }
+        let round = self.read_round.take().expect("ready round exists");
+        let index = round.safe_index().expect("ready round has safe index");
+        for read_id in round.into_requests() {
+            effects.push(Effect::ReadReady {
+                read_id,
+                read_index: index,
+            });
+        }
+    }
+
     fn on_message(
         &mut self,
         from: crate::NodeId,
@@ -301,19 +425,9 @@ impl<C> RaftCore<C> {
                     self.begin_term_transition(*term, PersistContinuation::None, effects)?;
                 }
             }
-            Message::AppendEntriesResponse {
-                term,
-                success,
-                match_index,
-                conflict,
-            } => self.on_append_entries_response(
-                from,
-                *term,
-                *success,
-                *match_index,
-                *conflict,
-                effects,
-            )?,
+            Message::AppendEntriesResponse { .. } => {
+                self.on_append_entries_response(from, message, effects)?
+            }
             Message::Heartbeat => {}
         }
         Ok(())
@@ -330,6 +444,7 @@ impl<C> RaftCore<C> {
             prev_log_index,
             prev_log_term,
             leader_commit,
+            read_context,
             entries,
         } = message
         else {
@@ -343,10 +458,13 @@ impl<C> RaftCore<C> {
         if term < current_term {
             self.send_append_entries_response(
                 from,
-                current_term,
-                false,
-                None,
-                prev_log_index,
+                AppendResponse {
+                    term: current_term,
+                    success: false,
+                    conflict: None,
+                    match_index: prev_log_index,
+                    read_context: read_context.clone(),
+                },
                 effects,
             );
             return Ok(());
@@ -392,6 +510,24 @@ impl<C> RaftCore<C> {
                 },
                 PersistContinuation::SendAppendEntriesResponse {
                     to: from,
+                    response: AppendResponse {
+                        term: self.hard_state.current_term(),
+                        success,
+                        conflict,
+                        match_index: if success {
+                            self.log.last_index()
+                        } else {
+                            prev_log_index
+                        },
+                        read_context: read_context.clone(),
+                    },
+                },
+                effects,
+            )?;
+        } else {
+            self.send_append_entries_response(
+                from,
+                AppendResponse {
                     term: self.hard_state.current_term(),
                     success,
                     conflict,
@@ -400,19 +536,7 @@ impl<C> RaftCore<C> {
                     } else {
                         prev_log_index
                     },
-                },
-                effects,
-            )?;
-        } else {
-            self.send_append_entries_response(
-                from,
-                self.hard_state.current_term(),
-                success,
-                conflict,
-                if success {
-                    self.log.last_index()
-                } else {
-                    prev_log_index
+                    read_context: read_context.clone(),
                 },
                 effects,
             );
@@ -423,12 +547,24 @@ impl<C> RaftCore<C> {
     fn on_append_entries_response(
         &mut self,
         from: crate::NodeId,
-        term: Term,
-        success: bool,
-        match_index: LogIndex,
-        conflict: Option<ConflictHint>,
+        message: &Message<C>,
         effects: &mut Vec<Effect<C>>,
     ) -> Result<(), StepError> {
+        let Message::AppendEntriesResponse {
+            term,
+            success,
+            match_index,
+            conflict,
+            read_context,
+        } = message
+        else {
+            return Ok(());
+        };
+        let term = *term;
+        let success = *success;
+        let match_index = *match_index;
+        let conflict = *conflict;
+        let read_context = read_context.as_deref();
         if term > self.hard_state.current_term() {
             return self.begin_term_transition(term, PersistContinuation::None, effects);
         }
@@ -453,6 +589,11 @@ impl<C> RaftCore<C> {
             None => progress.acknowledged(core::cmp::min(match_index, self.log.last_index())),
             Some(next_index) => progress.reject(match_index, next_index),
         };
+        if let Some(context) = read_context {
+            if success {
+                self.acknowledge_read_context(from, context, effects)?;
+            }
+        }
         if changed {
             self.replicate_to(from, effects)?;
             self.advance_commit(effects)?;
@@ -684,6 +825,7 @@ impl<C> RaftCore<C> {
             .map_err(StepError::Log)?;
         self.last_log_index = index;
         self.last_log_term = self.hard_state.current_term();
+        self.leader_noop_index = Some(index);
         self.queue_persist(
             PersistBatch {
                 hard_state: None,
@@ -720,6 +862,9 @@ impl<C> RaftCore<C> {
         self.votes = None;
         self.active_members.clear();
         self.progress.clear();
+        self.leader_noop_index = None;
+        self.pending_reads.clear();
+        self.read_round = None;
     }
 
     fn queue_persist(
@@ -820,6 +965,8 @@ impl<C> RaftCore<C> {
                 EffectOutcome::Applied { through } if through == pending.through => {
                     self.applied_index = through;
                     self.finish_apply(through, effects);
+                    self.release_read_round(effects);
+                    self.start_pending_reads(effects)?;
                     self.emit_apply_if_needed(effects)?;
                     return Ok(());
                 }
@@ -862,28 +1009,19 @@ impl<C> RaftCore<C> {
             PersistContinuation::SendVoteResponse { to, term, granted } => {
                 self.send_vote_response(to, term, granted, effects)
             }
-            PersistContinuation::SendAppendEntriesResponse {
-                to,
-                term,
-                success,
-                conflict,
-                match_index,
-            } => {
-                self.send_append_entries_response(
-                    to,
-                    term,
-                    success,
-                    conflict,
-                    match_index,
-                    effects,
-                );
+            PersistContinuation::SendAppendEntriesResponse { to, response } => {
+                self.send_append_entries_response(to, response, effects);
                 self.emit_apply_if_needed(effects)?;
             }
             PersistContinuation::ReplicateProposal => {
                 self.replicate_all(effects)?;
                 self.advance_commit(effects)?;
+                self.start_pending_reads(effects)?;
             }
-            PersistContinuation::ApplyCommitted => self.emit_apply_if_needed(effects)?,
+            PersistContinuation::ApplyCommitted => {
+                self.emit_apply_if_needed(effects)?;
+                self.start_pending_reads(effects)?;
+            }
             PersistContinuation::ActivateLeader => {
                 self.role = Role::Leader;
                 self.votes = None;
@@ -1001,6 +1139,7 @@ impl<C> RaftCore<C> {
                 prev_log_index,
                 prev_log_term,
                 leader_commit: self.hard_state.commit_index(),
+                read_context: None,
                 entries,
             },
         });
@@ -1034,6 +1173,33 @@ impl<C> RaftCore<C> {
         Ok(batch)
     }
 
+    fn send_read_heartbeats(&self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        let context = self
+            .read_round
+            .as_ref()
+            .expect("read round exists")
+            .context()
+            .to_vec();
+        let prev_log_index = self.log.last_index();
+        let prev_log_term = self.log.term(prev_log_index).map_err(StepError::Log)?;
+        for node in self.config.members() {
+            if *node != self.config.local_id() {
+                effects.push(Effect::SendMessage {
+                    to: *node,
+                    message: Message::AppendEntries {
+                        term: self.hard_state.current_term(),
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit: self.hard_state.commit_index(),
+                        read_context: Some(context.clone()),
+                        entries: Vec::new(),
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn send_pre_vote_response(
         &self,
         to: crate::NodeId,
@@ -1052,19 +1218,17 @@ impl<C> RaftCore<C> {
     fn send_append_entries_response(
         &self,
         to: crate::NodeId,
-        term: Term,
-        success: bool,
-        conflict: Option<ConflictHint>,
-        match_index: LogIndex,
+        response: AppendResponse,
         effects: &mut Vec<Effect<C>>,
     ) {
         effects.push(Effect::SendMessage {
             to,
             message: Message::AppendEntriesResponse {
-                term,
-                success,
-                conflict,
-                match_index,
+                term: response.term,
+                success: response.success,
+                conflict: response.conflict,
+                match_index: response.match_index,
+                read_context: response.read_context,
             },
         });
     }

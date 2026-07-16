@@ -85,6 +85,7 @@ pub enum Message<C> {
         prev_log_index: LogIndex,
         prev_log_term: Term,
         leader_commit: LogIndex,
+        read_context: Option<Vec<u8>>,
         entries: Vec<Entry<C>>,
     },
     /// A response to an AppendEntries request.
@@ -93,6 +94,7 @@ pub enum Message<C> {
         success: bool,
         match_index: LogIndex,
         conflict: Option<ConflictHint>,
+        read_context: Option<Vec<u8>>,
     },
     /// A snapshot transfer metadata message.
     InstallSnapshot {

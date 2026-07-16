@@ -110,6 +110,7 @@ fn successful_probe_enters_replicate_and_respects_window() {
             success: false,
             match_index: LogIndex::new(4),
             conflict: Some(ConflictHint::new(LogIndex::new(1), None)),
+            read_context: None,
         },
     );
     assert!(
@@ -124,6 +125,7 @@ fn successful_probe_enters_replicate_and_respects_window() {
             success: true,
             match_index: LogIndex::new(1),
             conflict: None,
+            read_context: None,
         },
     );
     assert_eq!(
@@ -156,6 +158,7 @@ fn conflict_term_hint_skips_to_the_last_leader_index_for_that_term() {
             success: false,
             match_index: LogIndex::new(4),
             conflict: Some(ConflictHint::new(LogIndex::new(1), Some(Term::new(1)))),
+            read_context: None,
         },
     );
     assert!(
@@ -174,6 +177,7 @@ fn stale_rejection_and_out_of_order_success_do_not_regress_progress() {
             success: false,
             match_index: LogIndex::new(4),
             conflict: Some(ConflictHint::new(LogIndex::new(1), None)),
+            read_context: None,
         },
     );
     receive(
@@ -184,6 +188,7 @@ fn stale_rejection_and_out_of_order_success_do_not_regress_progress() {
             success: true,
             match_index: LogIndex::new(1),
             conflict: None,
+            read_context: None,
         },
     );
     let next = core.progress(NodeId::new(2)).unwrap().next_index();
@@ -196,6 +201,7 @@ fn stale_rejection_and_out_of_order_success_do_not_regress_progress() {
                 success: false,
                 match_index: LogIndex::new(0),
                 conflict: Some(ConflictHint::new(LogIndex::new(1), None)),
+                read_context: None,
             }
         )
         .is_empty()
@@ -208,6 +214,7 @@ fn stale_rejection_and_out_of_order_success_do_not_regress_progress() {
             success: true,
             match_index: LogIndex::new(0),
             conflict: None,
+            read_context: None,
         },
     );
     assert_eq!(core.progress(NodeId::new(2)).unwrap().next_index(), next);
