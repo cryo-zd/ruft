@@ -153,13 +153,18 @@ fn heartbeat_persists_commit_advance_before_success_response() {
         })
         .unwrap()
         .effects;
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::SendMessage {
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendMessage {
             message: Message::AppendEntriesResponse { success: true, .. },
             ..
-        }]
-    ));
+        }
+    )));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Apply { .. }))
+    );
 }
 
 #[test]
