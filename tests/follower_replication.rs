@@ -54,6 +54,7 @@ fn append(
             prev_log_term: Term::new(previous_term),
             leader_commit: LogIndex::new(leader_commit),
             entries,
+            read_context: None,
         },
     )))
     .unwrap()
@@ -179,6 +180,7 @@ fn committed_prefix_conflict_is_rejected_as_a_log_invariant_error() {
             prev_log_index: LogIndex::new(0),
             prev_log_term: Term::new(0),
             leader_commit: LogIndex::new(0),
+            read_context: None,
             entries: vec![entry(1, 2)],
         },
     )));

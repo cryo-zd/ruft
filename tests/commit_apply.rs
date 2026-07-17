@@ -94,6 +94,7 @@ fn prior_term_entry_waits_for_a_current_term_quorum() {
             success: true,
             match_index: LogIndex::new(1),
             conflict: None,
+            read_context: None,
         },
     );
     assert!(effects.iter().all(|effect| !matches!(effect, Effect::Persist { batch, .. } if batch.hard_state.as_ref().is_some_and(|state| state.commit_index() > LogIndex::new(0)))));
@@ -106,6 +107,7 @@ fn prior_term_entry_waits_for_a_current_term_quorum() {
             success: true,
             match_index: LogIndex::new(2),
             conflict: None,
+            read_context: None,
         },
     );
     assert!(effects.iter().any(|effect| matches!(effect, Effect::Persist { batch, .. } if batch.hard_state.as_ref().is_some_and(|state| state.commit_index() == LogIndex::new(2)))));
@@ -147,6 +149,7 @@ fn quorum_commit_is_durable_before_ordered_apply_and_proposal_result() {
             success: true,
             match_index: LogIndex::new(3),
             conflict: None,
+            read_context: None,
         },
     );
     let commit_persist = match effects.iter().find_map(|effect| match effect {
@@ -225,6 +228,7 @@ fn uncommitted_proposal_reports_leadership_lost_after_higher_term_message() {
             success: false,
             match_index: LogIndex::new(2),
             conflict: None,
+            read_context: None,
         },
     );
     assert!(matches!(

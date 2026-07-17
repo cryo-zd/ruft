@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use crate::{Entry, HardState, LogIndex, NodeId, ProposalId, SnapshotRecord};
+use crate::{Entry, HardState, LogIndex, NodeId, ProposalId, ReadId, SnapshotRecord};
 
 /// The terminal outcome for one host proposal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +50,11 @@ pub enum Effect<C> {
     ProposalResult {
         proposal_id: ProposalId,
         result: ProposalResult,
+    },
+    /// Releases a linearizable read after quorum confirmation and local apply.
+    ReadReady {
+        read_id: ReadId,
+        read_index: LogIndex,
     },
     /// Applies committed entries to the host state machine.
     Apply {
