@@ -8,9 +8,10 @@ use crate::progress::{Progress, QuorumTracker};
 use crate::{
     Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogError,
     LogIndex, Message, PersistBatch, ProposalId, ProposalResult, RaftLog, ReadId, RecoveredState,
-    Term,
+    SnapshotMetadata, SnapshotRecord, SnapshotRef, Term,
     raft::{
-        PrefixDecision, ReadRound, is_log_up_to_date, quorum_commit, rejected_next, validate_prefix,
+        LocalSnapshotState, PrefixDecision, ReadRound, is_log_up_to_date, quorum_commit,
+        rejected_next, validate_prefix,
     },
 };
 
@@ -66,6 +67,9 @@ pub enum StepError {
     Log(LogError),
     Entry(crate::EntryError),
     ApplyFailed,
+    InvalidSnapshot,
+    SnapshotFailed,
+    CompactionFailed,
     PersistenceFailed,
     Stopped,
 }
@@ -133,6 +137,8 @@ pub struct RaftCore<C> {
     pending_reads: Vec<ReadId>,
     read_round: Option<ReadRound>,
     next_read_context: u64,
+    local_snapshot: LocalSnapshotState,
+    snapshot_index: LogIndex,
     next_effect_sequence: u64,
     stopped: bool,
     _command: core::marker::PhantomData<C>,
@@ -174,6 +180,10 @@ impl<C> RaftCore<C> {
             pending_reads: Vec::new(),
             read_round: None,
             next_read_context: 0,
+            local_snapshot: LocalSnapshotState::Idle,
+            snapshot_index: recovered
+                .snapshot()
+                .map_or(LogIndex::new(0), |snapshot| snapshot.metadata().index()),
             next_effect_sequence: 0,
             stopped: false,
             _command: core::marker::PhantomData,
@@ -207,6 +217,7 @@ impl<C> RaftCore<C> {
                 encoded_len,
             } => self.on_propose(proposal_id, command, encoded_len, &mut effects)?,
             Event::Read { read_id, .. } => self.on_read(read_id, &mut effects)?,
+            Event::SnapshotRequested => self.request_local_snapshot(&mut effects)?,
         }
         self.emit_apply_if_needed(&mut effects)?;
         if previous_role == Role::Leader && self.role != Role::Leader {
@@ -216,6 +227,16 @@ impl<C> RaftCore<C> {
             effects,
             soft_state_changed: previous_role != self.role,
         })
+    }
+
+    /// Returns the first log index still available as an entry.
+    pub fn first_log_index(&self) -> LogIndex {
+        self.log.first_index()
+    }
+
+    /// Returns the highest index applied to the local state machine.
+    pub const fn applied_index(&self) -> LogIndex {
+        self.applied_index
     }
 
     /// Returns leader-side progress for one remote member, when this node is leader.
@@ -231,6 +252,46 @@ impl<C> RaftCore<C> {
             role: self.role,
             stopped: self.stopped,
         }
+    }
+
+    fn request_local_snapshot(&mut self, effects: &mut Vec<Effect<C>>) -> Result<(), StepError> {
+        if !self.local_snapshot.is_idle() || self.applied_index <= self.snapshot_index {
+            return Ok(());
+        }
+        let through = self.applied_index;
+        let id = self.next_effect_id()?;
+        self.local_snapshot = LocalSnapshotState::Building { id, through };
+        effects.push(Effect::BuildSnapshot { id, through });
+        Ok(())
+    }
+
+    fn maybe_request_local_snapshot(
+        &mut self,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        let applied_since_snapshot = self
+            .applied_index
+            .get()
+            .saturating_sub(self.snapshot_index.get());
+        if applied_since_snapshot >= self.config.snapshot_after_entries() as u64 {
+            self.request_local_snapshot(effects)?;
+        }
+        Ok(())
+    }
+
+    fn validate_local_snapshot(
+        &self,
+        metadata: SnapshotMetadata,
+        snapshot_ref: SnapshotRef,
+        through: LogIndex,
+    ) -> Result<SnapshotRecord, StepError> {
+        if metadata.index() != through
+            || metadata.term() != self.log.term(through).map_err(StepError::Log)?
+            || metadata.members() != self.config.members()
+        {
+            return Err(StepError::InvalidSnapshot);
+        }
+        Ok(SnapshotRecord::new(metadata, snapshot_ref))
     }
 
     fn on_propose(
@@ -947,6 +1008,121 @@ impl<C> RaftCore<C> {
         }
     }
 
+    fn on_snapshot_completion(
+        &mut self,
+        id: EffectId,
+        outcome: &EffectOutcome,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<bool, StepError> {
+        let state = core::mem::replace(&mut self.local_snapshot, LocalSnapshotState::Idle);
+        match state {
+            LocalSnapshotState::Idle => Ok(false),
+            LocalSnapshotState::Building {
+                id: expected,
+                through,
+            } if expected == id => match outcome {
+                EffectOutcome::SnapshotBuilt {
+                    metadata,
+                    snapshot_ref,
+                } => {
+                    let record = match self.validate_local_snapshot(
+                        metadata.clone(),
+                        snapshot_ref.clone(),
+                        through,
+                    ) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            self.local_snapshot = LocalSnapshotState::Building {
+                                id: expected,
+                                through,
+                            };
+                            return Err(error);
+                        }
+                    };
+                    let persist_id = self.next_effect_id()?;
+                    self.local_snapshot = LocalSnapshotState::Persisting {
+                        id: persist_id,
+                        record: record.clone(),
+                    };
+                    effects.push(Effect::Persist {
+                        id: persist_id,
+                        batch: PersistBatch {
+                            hard_state: None,
+                            entries: Vec::new(),
+                            snapshot: Some(record),
+                        },
+                    });
+                    Ok(true)
+                }
+                EffectOutcome::Failed => {
+                    self.stopped = true;
+                    Err(StepError::SnapshotFailed)
+                }
+                _ => {
+                    self.local_snapshot = LocalSnapshotState::Building {
+                        id: expected,
+                        through,
+                    };
+                    Err(StepError::Input(InputError::InvalidEffectOutcome))
+                }
+            },
+            LocalSnapshotState::Persisting {
+                id: expected,
+                record,
+            } if expected == id => match outcome {
+                EffectOutcome::Persisted => {
+                    let compact_id = self.next_effect_id()?;
+                    let through = record.metadata().index();
+                    self.local_snapshot = LocalSnapshotState::Compacting {
+                        id: compact_id,
+                        record,
+                    };
+                    effects.push(Effect::CompactLog {
+                        id: compact_id,
+                        through,
+                    });
+                    Ok(true)
+                }
+                EffectOutcome::Failed => {
+                    self.stopped = true;
+                    Err(StepError::PersistenceFailed)
+                }
+                _ => {
+                    self.local_snapshot = LocalSnapshotState::Persisting {
+                        id: expected,
+                        record,
+                    };
+                    Err(StepError::Input(InputError::InvalidEffectOutcome))
+                }
+            },
+            LocalSnapshotState::Compacting {
+                id: expected,
+                record,
+            } if expected == id => match outcome {
+                EffectOutcome::Compacted { through } if *through == record.metadata().index() => {
+                    self.log.compact(record).map_err(StepError::Log)?;
+                    self.snapshot_index = *through;
+                    Ok(true)
+                }
+                EffectOutcome::Failed => {
+                    self.stopped = true;
+                    Err(StepError::CompactionFailed)
+                }
+                _ => {
+                    self.local_snapshot = LocalSnapshotState::Compacting {
+                        id: expected,
+                        record,
+                    };
+                    Err(StepError::Input(InputError::InvalidEffectOutcome))
+                }
+            },
+            state => {
+                self.local_snapshot = state;
+                Ok(false)
+            }
+        }
+    }
+
     fn on_effect_completed(
         &mut self,
         id: EffectId,
@@ -955,6 +1131,9 @@ impl<C> RaftCore<C> {
     ) -> Result<(), StepError> {
         if id.generation() != self.config.generation() {
             return Err(StepError::Input(InputError::StaleEffectGeneration));
+        }
+        if self.on_snapshot_completion(id, &outcome, effects)? {
+            return Ok(());
         }
         if let Some(pending) = self.pending_apply.take() {
             if pending.id != id {
@@ -968,6 +1147,7 @@ impl<C> RaftCore<C> {
                     self.release_read_round(effects);
                     self.start_pending_reads(effects)?;
                     self.emit_apply_if_needed(effects)?;
+                    self.maybe_request_local_snapshot(effects)?;
                     return Ok(());
                 }
                 EffectOutcome::Failed => {
