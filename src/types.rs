@@ -58,7 +58,7 @@ impl LogIndex {
 }
 
 /// Correlates an asynchronous effect with its completion event.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct EffectId {
     generation: u64,

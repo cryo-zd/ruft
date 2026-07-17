@@ -306,6 +306,34 @@ impl<C> RaftLog<C> {
         Ok(())
     }
 
+    /// Returns the installed snapshot record, if any.
+    pub const fn snapshot(&self) -> Option<&SnapshotRecord> {
+        self.snapshot.as_ref()
+    }
+
+    /// Installs a received snapshot and retains the suffix only when its boundary matches.
+    pub fn install_snapshot(&mut self, snapshot: SnapshotRecord) -> Result<(), LogError> {
+        let through = snapshot.metadata().index();
+        let retains_suffix = self
+            .term(through)
+            .is_ok_and(|term| term == snapshot.metadata().term());
+        if retains_suffix {
+            let first = self.first_index();
+            let drain =
+                usize::try_from(through.get().saturating_add(1).saturating_sub(first.get()))
+                    .map_err(|_| LogError::IndexTooLarge { index: through })?;
+            self.entries.drain(..drain.min(self.entries.len()));
+        } else {
+            self.entries.clear();
+        }
+        self.unstable.discard_through(through);
+        self.snapshot = Some(snapshot);
+        if through > self.committed {
+            self.committed = through;
+        }
+        Ok(())
+    }
+
     /// Installs a snapshot boundary and discards only the prefix it represents.
     pub fn compact(&mut self, snapshot: SnapshotRecord) -> Result<(), LogError> {
         let through = snapshot.metadata().index();
