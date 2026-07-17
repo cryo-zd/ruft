@@ -27,6 +27,8 @@ pub enum Event<C> {
     },
     /// Requests a linearizable read barrier.
     Read { read_id: ReadId, context: Vec<u8> },
+    /// Requests a local snapshot at the highest applied index.
+    SnapshotRequested,
     /// Reports completion of an earlier effect.
     EffectCompleted {
         id: EffectId,

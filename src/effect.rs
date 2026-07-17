@@ -2,7 +2,10 @@
 
 #![allow(missing_docs)]
 
-use crate::{Entry, HardState, LogIndex, NodeId, ProposalId, ReadId, SnapshotRecord};
+use crate::{
+    Entry, HardState, LogIndex, NodeId, ProposalId, ReadId, SnapshotMetadata, SnapshotRecord,
+    SnapshotRef,
+};
 
 /// The terminal outcome for one host proposal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +23,18 @@ pub enum ProposalResult {
 #[non_exhaustive]
 pub enum EffectOutcome {
     Persisted,
-    Applied { through: LogIndex },
+    Applied {
+        through: LogIndex,
+    },
+    /// A host-built local snapshot body and its validated metadata.
+    SnapshotBuilt {
+        metadata: SnapshotMetadata,
+        snapshot_ref: SnapshotRef,
+    },
+    /// The durable log prefix through an index was removed.
+    Compacted {
+        through: LogIndex,
+    },
     Failed,
 }
 
@@ -60,6 +74,16 @@ pub enum Effect<C> {
     Apply {
         id: crate::EffectId,
         entries: Vec<Entry<C>>,
+    },
+    /// Builds an externally stored snapshot body through an applied log index.
+    BuildSnapshot {
+        id: crate::EffectId,
+        through: LogIndex,
+    },
+    /// Removes a durable prefix after snapshot metadata is durable.
+    CompactLog {
+        id: crate::EffectId,
+        through: LogIndex,
     },
     /// Emits an informational record for host observability.
     Diagnostic { node: NodeId },
