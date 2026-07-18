@@ -2,6 +2,82 @@ use core::fmt;
 
 use crate::NodeId;
 
+/// A violation of an internal Raft safety invariant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum InvariantViolation {
+    /// The state machine has advanced beyond the durable commit index.
+    AppliedPastCommit,
+    /// The durable commit index is beyond the available log.
+    CommitPastLog,
+    /// The available suffix leaves a gap after the committed prefix.
+    CommittedGap,
+    /// The logical log and durable hard state disagree on the commit index.
+    CommitIndexMismatch,
+    /// Cached last-log metadata disagrees with the logical log.
+    LastLogMismatch,
+    /// An index required by invariant validation cannot be incremented.
+    IndexOverflow,
+    /// The log suffix is not continuous or its terms regress.
+    Log(crate::LogError),
+}
+
+impl fmt::Display for InvariantViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AppliedPastCommit => formatter.write_str("applied index is beyond commit index"),
+            Self::CommitPastLog => formatter.write_str("commit index is beyond last log index"),
+            Self::CommittedGap => formatter.write_str("committed prefix has a gap in the log"),
+            Self::CommitIndexMismatch => {
+                formatter.write_str("hard state and log commit indexes differ")
+            }
+            Self::LastLogMismatch => {
+                formatter.write_str("cached last-log metadata differs from the log")
+            }
+            Self::IndexOverflow => {
+                formatter.write_str("index overflow during invariant validation")
+            }
+            Self::Log(error) => write!(formatter, "log invariant failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for InvariantViolation {}
+
+/// A failure that makes continued operation of this core unsafe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FatalError {
+    /// Storage did not complete an operation required for correctness.
+    Storage,
+    /// The application state machine could not apply or build state.
+    StateMachine,
+    /// Internal state no longer satisfies a Raft safety invariant.
+    Invariant(InvariantViolation),
+}
+
+impl fmt::Display for FatalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage => formatter.write_str("fatal storage failure"),
+            Self::StateMachine => formatter.write_str("fatal state machine failure"),
+            Self::Invariant(error) => write!(formatter, "fatal invariant violation: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for FatalError {}
+
+/// The reason a core no longer accepts protocol work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StoppedReason {
+    /// The host explicitly shut down this core.
+    Shutdown,
+    /// A fatal correctness fault was reported by the host or detected locally.
+    Fatal(FatalError),
+}
+
 /// An error raised by checked arithmetic on a protocol counter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
