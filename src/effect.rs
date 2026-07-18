@@ -27,6 +27,20 @@ pub enum EffectOutcome {
         through: LogIndex,
     },
     /// A host-built local snapshot body and its validated metadata.
+    SnapshotChunkRead {
+        snapshot_id: crate::SnapshotId,
+        offset: u64,
+        bytes: Vec<u8>,
+        done: bool,
+    },
+    SnapshotChunkStored {
+        snapshot_id: crate::SnapshotId,
+        next_offset: u64,
+        snapshot_ref: Option<SnapshotRef>,
+    },
+    SnapshotInstalled {
+        snapshot_id: crate::SnapshotId,
+    },
     SnapshotBuilt {
         metadata: SnapshotMetadata,
         snapshot_ref: SnapshotRef,
@@ -74,6 +88,25 @@ pub enum Effect<C> {
     Apply {
         id: crate::EffectId,
         entries: Vec<Entry<C>>,
+    },
+    /// Reads one bounded chunk from a local snapshot body for transmission.
+    ReadSnapshotChunk {
+        id: crate::EffectId,
+        snapshot: SnapshotRecord,
+        offset: u64,
+        max_len: usize,
+    },
+    /// Stores one validated incoming snapshot chunk.
+    StoreSnapshotChunk {
+        id: crate::EffectId,
+        metadata: SnapshotMetadata,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    /// Installs a durable snapshot into the host state machine.
+    InstallSnapshot {
+        id: crate::EffectId,
+        record: SnapshotRecord,
     },
     /// Builds an externally stored snapshot body through an applied log index.
     BuildSnapshot {

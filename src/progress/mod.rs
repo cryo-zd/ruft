@@ -124,4 +124,10 @@ impl Progress {
         self.state = ProgressState::Snapshot;
         self.inflights.clear();
     }
+
+    pub(crate) fn restore_probe(&mut self, next_index: LogIndex) {
+        self.state = ProgressState::Probe;
+        self.next_index = next_index;
+        self.inflights.clear();
+    }
 }

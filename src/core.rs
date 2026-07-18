@@ -10,8 +10,8 @@ use crate::{
     LogIndex, Message, PersistBatch, ProposalId, ProposalResult, RaftLog, ReadId, RecoveredState,
     SnapshotMetadata, SnapshotRecord, SnapshotRef, Term,
     raft::{
-        LocalSnapshotState, PrefixDecision, ReadRound, is_log_up_to_date, quorum_commit,
-        rejected_next, validate_prefix,
+        LocalSnapshotState, PrefixDecision, ReadRound, SnapshotReceiver, SnapshotSender,
+        is_log_up_to_date, quorum_commit, rejected_next, validate_prefix,
     },
 };
 
@@ -106,6 +106,28 @@ enum PersistContinuation {
     None,
 }
 
+struct PendingChunkStore {
+    id: EffectId,
+    done: bool,
+    from: crate::NodeId,
+    term: Term,
+}
+
+enum IncomingSnapshotState {
+    Persisting {
+        id: EffectId,
+        record: SnapshotRecord,
+        from: crate::NodeId,
+        term: Term,
+    },
+    Installing {
+        id: EffectId,
+        record: SnapshotRecord,
+        from: crate::NodeId,
+        term: Term,
+    },
+}
+
 struct PendingApply {
     id: EffectId,
     through: LogIndex,
@@ -138,6 +160,11 @@ pub struct RaftCore<C> {
     read_round: Option<ReadRound>,
     next_read_context: u64,
     local_snapshot: LocalSnapshotState,
+    incoming_snapshot: Option<SnapshotReceiver>,
+    pending_chunk_store: Option<PendingChunkStore>,
+    incoming_snapshot_state: Option<IncomingSnapshotState>,
+    snapshot_senders: BTreeMap<crate::NodeId, SnapshotSender>,
+    pending_snapshot_reads: BTreeMap<EffectId, crate::NodeId>,
     snapshot_index: LogIndex,
     next_effect_sequence: u64,
     stopped: bool,
@@ -181,6 +208,11 @@ impl<C> RaftCore<C> {
             read_round: None,
             next_read_context: 0,
             local_snapshot: LocalSnapshotState::Idle,
+            incoming_snapshot: None,
+            pending_chunk_store: None,
+            incoming_snapshot_state: None,
+            snapshot_senders: BTreeMap::new(),
+            pending_snapshot_reads: BTreeMap::new(),
             snapshot_index: recovered
                 .snapshot()
                 .map_or(LogIndex::new(0), |snapshot| snapshot.metadata().index()),
@@ -481,16 +513,119 @@ impl<C> RaftCore<C> {
                 self.on_vote_response(from, *term, *granted, effects)?
             }
             Message::AppendEntries { .. } => self.on_append_entries(from, message, effects)?,
-            Message::InstallSnapshot { term, .. } => {
-                if *term > self.hard_state.current_term() {
-                    self.begin_term_transition(*term, PersistContinuation::None, effects)?;
-                }
+            Message::InstallSnapshot { .. } => {
+                self.on_install_snapshot_chunk(from, message, effects)?
+            }
+            Message::InstallSnapshotResponse { term, success } => {
+                self.on_install_snapshot_response(from, *term, *success, effects)?
             }
             Message::AppendEntriesResponse { .. } => {
                 self.on_append_entries_response(from, message, effects)?
             }
             Message::Heartbeat => {}
         }
+        Ok(())
+    }
+
+    fn on_install_snapshot_response(
+        &mut self,
+        from: crate::NodeId,
+        term: Term,
+        success: bool,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        if term > self.hard_state.current_term() {
+            return self.begin_term_transition(term, PersistContinuation::None, effects);
+        }
+        if self.role != Role::Leader || term != self.hard_state.current_term() || !success {
+            return Ok(());
+        }
+        let Some(sender) = self.snapshot_senders.remove(&from) else {
+            return Ok(());
+        };
+        let next = sender
+            .snapshot()
+            .metadata()
+            .index()
+            .checked_next()
+            .map_err(StepError::Arithmetic)?;
+        if let Some(progress) = self.progress.get_mut(&from) {
+            progress.restore_probe(next);
+        }
+        self.replicate_to(from, effects)
+    }
+
+    fn on_install_snapshot_chunk(
+        &mut self,
+        from: crate::NodeId,
+        message: &Message<C>,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        let Message::InstallSnapshot {
+            term,
+            metadata,
+            offset,
+            bytes,
+            done,
+        } = message
+        else {
+            return Ok(());
+        };
+        let term = *term;
+        let offset = *offset;
+        let done = *done;
+        if term < self.hard_state.current_term() {
+            effects.push(Effect::SendMessage {
+                to: from,
+                message: Message::InstallSnapshotResponse {
+                    term: self.hard_state.current_term(),
+                    success: false,
+                },
+            });
+            return Ok(());
+        }
+        if bytes.len() > self.config.snapshot_chunk_bytes() {
+            return Err(StepError::InvalidSnapshot);
+        }
+        if metadata.members() != self.config.members() || metadata.index() <= self.snapshot_index {
+            return Ok(());
+        }
+        if self
+            .incoming_snapshot
+            .as_ref()
+            .is_none_or(|receiver| receiver.metadata().id() != metadata.id())
+        {
+            if offset != 0 || self.pending_chunk_store.is_some() {
+                return Err(StepError::InvalidSnapshot);
+            }
+            self.incoming_snapshot = Some(SnapshotReceiver::new(metadata.clone()));
+        }
+        let receiver = self
+            .incoming_snapshot
+            .as_mut()
+            .expect("receiver was initialized");
+        if receiver.metadata() != metadata {
+            return Err(StepError::InvalidSnapshot);
+        }
+        if !receiver
+            .accept(offset, bytes, done)
+            .map_err(|_| StepError::InvalidSnapshot)?
+        {
+            return Ok(());
+        }
+        let id = self.next_effect_id()?;
+        self.pending_chunk_store = Some(PendingChunkStore {
+            id,
+            done,
+            from,
+            term,
+        });
+        effects.push(Effect::StoreSnapshotChunk {
+            id,
+            metadata: metadata.clone(),
+            offset,
+            bytes: bytes.to_vec(),
+        });
         Ok(())
     }
 
@@ -1008,6 +1143,165 @@ impl<C> RaftCore<C> {
         }
     }
 
+    fn on_incoming_snapshot_completion(
+        &mut self,
+        id: EffectId,
+        outcome: &EffectOutcome,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<bool, StepError> {
+        if let Some(pending) = self.pending_chunk_store.take() {
+            if pending.id != id {
+                self.pending_chunk_store = Some(pending);
+            } else {
+                match outcome {
+                    EffectOutcome::SnapshotChunkStored {
+                        snapshot_id,
+                        next_offset,
+                        snapshot_ref,
+                    } => {
+                        let receiver = self
+                            .incoming_snapshot
+                            .as_ref()
+                            .expect("chunk store has a receiver");
+                        if *snapshot_id != receiver.metadata().id()
+                            || *next_offset != receiver.next_offset()
+                        {
+                            return Err(StepError::InvalidSnapshot);
+                        }
+                        if pending.done {
+                            if !receiver.is_complete_and_valid() {
+                                return Err(StepError::InvalidSnapshot);
+                            }
+                            let snapshot_ref =
+                                snapshot_ref.clone().ok_or(StepError::InvalidSnapshot)?;
+                            let record = receiver.record(snapshot_ref);
+                            let persist_id = self.next_effect_id()?;
+                            self.incoming_snapshot_state =
+                                Some(IncomingSnapshotState::Persisting {
+                                    id: persist_id,
+                                    record: record.clone(),
+                                    from: pending.from,
+                                    term: pending.term,
+                                });
+                            effects.push(Effect::Persist {
+                                id: persist_id,
+                                batch: PersistBatch {
+                                    hard_state: Some(HardState::new(
+                                        pending.term,
+                                        None,
+                                        self.hard_state
+                                            .commit_index()
+                                            .max(record.metadata().index()),
+                                    )),
+                                    entries: Vec::new(),
+                                    snapshot: Some(record),
+                                },
+                            });
+                        }
+                        return Ok(true);
+                    }
+                    EffectOutcome::Failed => {
+                        self.stopped = true;
+                        return Err(StepError::PersistenceFailed);
+                    }
+                    _ => {
+                        self.pending_chunk_store = Some(pending);
+                        return Err(StepError::Input(InputError::InvalidEffectOutcome));
+                    }
+                }
+            }
+        }
+        let Some(state) = self.incoming_snapshot_state.take() else {
+            return Ok(false);
+        };
+        match state {
+            IncomingSnapshotState::Persisting {
+                id: expected,
+                record,
+                from,
+                term,
+            } if expected == id => match outcome {
+                EffectOutcome::Persisted => {
+                    let install_id = self.next_effect_id()?;
+                    self.incoming_snapshot_state = Some(IncomingSnapshotState::Installing {
+                        id: install_id,
+                        record: record.clone(),
+                        from,
+                        term,
+                    });
+                    effects.push(Effect::InstallSnapshot {
+                        id: install_id,
+                        record,
+                    });
+                    Ok(true)
+                }
+                EffectOutcome::Failed => {
+                    self.stopped = true;
+                    Err(StepError::PersistenceFailed)
+                }
+                _ => {
+                    self.incoming_snapshot_state = Some(IncomingSnapshotState::Persisting {
+                        id: expected,
+                        record,
+                        from,
+                        term,
+                    });
+                    Err(StepError::Input(InputError::InvalidEffectOutcome))
+                }
+            },
+            IncomingSnapshotState::Installing {
+                id: expected,
+                record,
+                from,
+                term,
+            } if expected == id => match outcome {
+                EffectOutcome::SnapshotInstalled { snapshot_id }
+                    if *snapshot_id == record.metadata().id() =>
+                {
+                    self.log
+                        .install_snapshot(record.clone())
+                        .map_err(StepError::Log)?;
+                    self.snapshot_index = record.metadata().index();
+                    self.applied_index = self.applied_index.max(self.snapshot_index);
+                    self.hard_state = HardState::new(
+                        self.hard_state.current_term().max(term),
+                        None,
+                        self.hard_state.commit_index().max(self.snapshot_index),
+                    );
+                    self.last_log_index = self.log.last_index();
+                    self.last_log_term =
+                        self.log.term(self.last_log_index).map_err(StepError::Log)?;
+                    self.incoming_snapshot = None;
+                    effects.push(Effect::SendMessage {
+                        to: from,
+                        message: Message::InstallSnapshotResponse {
+                            term: self.hard_state.current_term(),
+                            success: true,
+                        },
+                    });
+                    Ok(true)
+                }
+                EffectOutcome::Failed => {
+                    self.stopped = true;
+                    Err(StepError::ApplyFailed)
+                }
+                _ => {
+                    self.incoming_snapshot_state = Some(IncomingSnapshotState::Installing {
+                        id: expected,
+                        record,
+                        from,
+                        term,
+                    });
+                    Err(StepError::Input(InputError::InvalidEffectOutcome))
+                }
+            },
+            state => {
+                self.incoming_snapshot_state = Some(state);
+                Ok(false)
+            }
+        }
+    }
+
     fn on_snapshot_completion(
         &mut self,
         id: EffectId,
@@ -1131,6 +1425,12 @@ impl<C> RaftCore<C> {
     ) -> Result<(), StepError> {
         if id.generation() != self.config.generation() {
             return Err(StepError::Input(InputError::StaleEffectGeneration));
+        }
+        if self.on_outgoing_snapshot_completion(id, &outcome, effects)? {
+            return Ok(());
+        }
+        if self.on_incoming_snapshot_completion(id, &outcome, effects)? {
+            return Ok(());
         }
         if self.on_snapshot_completion(id, &outcome, effects)? {
             return Ok(());
@@ -1301,7 +1601,7 @@ impl<C> RaftCore<C> {
                 .get_mut(&to)
                 .expect("progress entry was checked")
                 .enter_snapshot();
-            return Ok(());
+            return self.read_snapshot_chunk(to, effects);
         }
         let prev_log_index = LogIndex::new(next.get() - 1);
         let prev_log_term = self.log.term(prev_log_index).map_err(StepError::Log)?;
@@ -1324,6 +1624,93 @@ impl<C> RaftCore<C> {
             },
         });
         Ok(())
+    }
+
+    fn read_snapshot_chunk(
+        &mut self,
+        to: crate::NodeId,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<(), StepError> {
+        if self.pending_snapshot_reads.values().any(|peer| *peer == to) {
+            return Ok(());
+        }
+        if !self.snapshot_senders.contains_key(&to) {
+            let snapshot = self
+                .log
+                .snapshot()
+                .cloned()
+                .ok_or(StepError::InvalidSnapshot)?;
+            self.snapshot_senders
+                .insert(to, SnapshotSender::new(snapshot));
+        }
+        let (snapshot, offset) = {
+            let sender = self
+                .snapshot_senders
+                .get(&to)
+                .expect("sender was initialized");
+            (sender.snapshot().clone(), sender.offset())
+        };
+        let id = self.next_effect_id()?;
+        self.pending_snapshot_reads.insert(id, to);
+        effects.push(Effect::ReadSnapshotChunk {
+            id,
+            snapshot,
+            offset,
+            max_len: self.config.snapshot_chunk_bytes(),
+        });
+        Ok(())
+    }
+
+    fn on_outgoing_snapshot_completion(
+        &mut self,
+        id: EffectId,
+        outcome: &EffectOutcome,
+        effects: &mut Vec<Effect<C>>,
+    ) -> Result<bool, StepError> {
+        let Some(to) = self.pending_snapshot_reads.remove(&id) else {
+            return Ok(false);
+        };
+        let sender = self
+            .snapshot_senders
+            .get_mut(&to)
+            .expect("read has a sender");
+        match outcome {
+            EffectOutcome::SnapshotChunkRead {
+                snapshot_id,
+                offset,
+                bytes,
+                done,
+            } if *snapshot_id == sender.snapshot().metadata().id()
+                && *offset == sender.offset() =>
+            {
+                if bytes.len() > self.config.snapshot_chunk_bytes() {
+                    return Err(StepError::InvalidSnapshot);
+                }
+                let metadata = sender.snapshot().metadata().clone();
+                sender
+                    .advance(bytes.len())
+                    .map_err(|_| StepError::InvalidSnapshot)?;
+                effects.push(Effect::SendMessage {
+                    to,
+                    message: Message::InstallSnapshot {
+                        term: self.hard_state.current_term(),
+                        metadata,
+                        offset: *offset,
+                        bytes: bytes.clone(),
+                        done: *done,
+                    },
+                });
+                if !done {
+                    self.read_snapshot_chunk(to, effects)?;
+                }
+                Ok(true)
+            }
+            EffectOutcome::Failed => {
+                self.stopped = true;
+                Err(StepError::PersistenceFailed)
+            }
+            _ => Err(StepError::Input(InputError::InvalidEffectOutcome)),
+        }
     }
 
     fn replication_batch(&self, next: LogIndex) -> Result<Vec<Entry<C>>, StepError> {

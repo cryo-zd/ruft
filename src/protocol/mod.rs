@@ -96,9 +96,14 @@ pub enum Message<C> {
         conflict: Option<ConflictHint>,
         read_context: Option<Vec<u8>>,
     },
-    /// A snapshot transfer metadata message.
+    /// One bounded chunk of a snapshot transfer.
     InstallSnapshot {
         term: Term,
         metadata: SnapshotMetadata,
+        offset: u64,
+        bytes: Vec<u8>,
+        done: bool,
     },
+    /// A response after a snapshot is durably installed.
+    InstallSnapshotResponse { term: Term, success: bool },
 }
