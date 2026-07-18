@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::progress::{Progress, QuorumTracker};
 use crate::{
-    Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, HardState, LogError,
-    LogIndex, Message, PersistBatch, ProposalId, ProposalResult, RaftLog, ReadId, RecoveredState,
-    SnapshotMetadata, SnapshotRecord, SnapshotRef, Term,
+    Config, ConflictHint, Effect, EffectId, EffectOutcome, Entry, Event, FatalError, HardState,
+    InvariantViolation, LogError, LogIndex, Message, PersistBatch, ProposalId, ProposalResult,
+    RaftLog, ReadId, RecoveredState, SnapshotMetadata, SnapshotRecord, SnapshotRef, StoppedReason,
+    Term, invariant,
     raft::{
         LocalSnapshotState, PrefixDecision, ReadRound, SnapshotReceiver, SnapshotSender,
         is_log_up_to_date, quorum_commit, rejected_next, validate_prefix,
@@ -31,6 +32,7 @@ pub struct Status {
     term: Term,
     role: Role,
     stopped: bool,
+    stopped_reason: Option<StoppedReason>,
 }
 
 impl Status {
@@ -46,6 +48,11 @@ impl Status {
     pub const fn is_stopped(&self) -> bool {
         self.stopped
     }
+
+    /// Returns the first reason this core entered its stopped state.
+    pub fn stopped_reason(&self) -> Option<StoppedReason> {
+        self.stopped_reason.clone()
+    }
 }
 
 /// A rejected host input that does not change core state.
@@ -56,6 +63,8 @@ pub enum InputError {
     UnknownSender,
     StaleEffectGeneration,
     UnknownEffect,
+    AlreadyCompleted,
+    ConflictingEffectOutcome,
     InvalidEffectOutcome,
 }
 
@@ -71,7 +80,8 @@ pub enum StepError {
     SnapshotFailed,
     CompactionFailed,
     PersistenceFailed,
-    Stopped,
+    Fatal(FatalError),
+    Stopped(StoppedReason),
 }
 
 /// Effects and volatile-state notification emitted for one input event.
@@ -168,6 +178,11 @@ pub struct RaftCore<C> {
     snapshot_index: LogIndex,
     next_effect_sequence: u64,
     stopped: bool,
+    stopped_reason: Option<StoppedReason>,
+    completed_frontier: u64,
+    completed_sparse: BTreeSet<u64>,
+    completed_outcomes: BTreeMap<EffectId, EffectOutcome>,
+    completion_order: std::collections::VecDeque<EffectId>,
     _command: core::marker::PhantomData<C>,
 }
 
@@ -218,42 +233,71 @@ impl<C> RaftCore<C> {
                 .map_or(LogIndex::new(0), |snapshot| snapshot.metadata().index()),
             next_effect_sequence: 0,
             stopped: false,
+            stopped_reason: None,
+            completed_frontier: 0,
+            completed_sparse: BTreeSet::new(),
+            completed_outcomes: BTreeMap::new(),
+            completion_order: std::collections::VecDeque::new(),
             _command: core::marker::PhantomData,
         })
     }
 
     /// Applies one event and returns host work required by the transition.
     pub fn step(&mut self, event: Event<C>) -> Result<StepOutput<C>, StepError> {
-        if self.stopped && !matches!(event, Event::Shutdown) {
-            return Err(StepError::Stopped);
+        if self.stopped {
+            return match event {
+                Event::Shutdown | Event::Tick(_) | Event::MessageReceived(_) => Ok(StepOutput {
+                    effects: Vec::new(),
+                    soft_state_changed: false,
+                }),
+                _ => Err(StepError::Stopped(
+                    self.stopped_reason
+                        .clone()
+                        .expect("stopped cores have a reason"),
+                )),
+            };
         }
+
         let previous_role = self.role;
         let mut effects = Vec::new();
-        match event {
-            Event::Tick(crate::TickKind::Election) => self.start_pre_vote(&mut effects)?,
-            Event::Tick(crate::TickKind::Heartbeat) => self.on_heartbeat_tick(&mut effects)?,
-            Event::MessageReceived(envelope) => {
-                self.validate_envelope(&envelope)?;
-                if self.role == Role::Leader {
-                    self.active_members.insert(envelope.from());
+        let result = (|| {
+            match event {
+                Event::Tick(crate::TickKind::Election) => self.start_pre_vote(&mut effects)?,
+                Event::Tick(crate::TickKind::Heartbeat) => self.on_heartbeat_tick(&mut effects)?,
+                Event::MessageReceived(envelope) => {
+                    self.validate_envelope(&envelope)?;
+                    if self.role == Role::Leader {
+                        self.active_members.insert(envelope.from());
+                    }
+                    self.on_message(envelope.from(), envelope.message(), &mut effects)?;
                 }
-                self.on_message(envelope.from(), envelope.message(), &mut effects)?;
+                Event::EffectCompleted { id, outcome } => {
+                    self.validate_completion(id, &outcome)?;
+                    self.on_effect_completed(id, outcome.clone(), &mut effects)?;
+                    self.record_completion(id, outcome);
+                }
+                Event::Shutdown => self.stop(StoppedReason::Shutdown),
+                Event::Propose {
+                    proposal_id,
+                    command,
+                    encoded_len,
+                } => {
+                    self.on_propose(proposal_id, command, encoded_len, &mut effects)?;
+                }
+                Event::Read { read_id, .. } => self.on_read(read_id, &mut effects)?,
+                Event::SnapshotRequested => self.request_local_snapshot(&mut effects)?,
             }
-            Event::EffectCompleted { id, outcome } => {
-                self.on_effect_completed(id, outcome, &mut effects)?
-            }
-            Event::Shutdown => self.stopped = true,
-            Event::Propose {
-                proposal_id,
-                command,
-                encoded_len,
-            } => self.on_propose(proposal_id, command, encoded_len, &mut effects)?,
-            Event::Read { read_id, .. } => self.on_read(read_id, &mut effects)?,
-            Event::SnapshotRequested => self.request_local_snapshot(&mut effects)?,
+            self.emit_apply_if_needed(&mut effects)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(self.fatalize(error));
         }
-        self.emit_apply_if_needed(&mut effects)?;
         if previous_role == Role::Leader && self.role != Role::Leader {
             self.fail_uncommitted_proposals(&mut effects);
+        }
+        if let Err(violation) = self.validate_invariants() {
+            return Err(self.fatal(FatalError::Invariant(violation)));
         }
         Ok(StepOutput {
             effects,
@@ -283,6 +327,88 @@ impl<C> RaftCore<C> {
             term: self.hard_state.current_term(),
             role: self.role,
             stopped: self.stopped,
+            stopped_reason: self.stopped_reason.clone(),
+        }
+    }
+
+    /// Returns whether this instance has stopped processing protocol work.
+    pub const fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    fn validate_invariants(&self) -> Result<(), InvariantViolation> {
+        invariant::validate(
+            &self.hard_state,
+            &self.log,
+            self.applied_index,
+            self.last_log_index,
+            self.last_log_term,
+        )
+    }
+
+    fn stop(&mut self, reason: StoppedReason) {
+        if self.stopped_reason.is_none() {
+            self.stopped_reason = Some(reason);
+        }
+        self.stopped = true;
+    }
+
+    fn fatal(&mut self, error: FatalError) -> StepError {
+        self.stop(StoppedReason::Fatal(error.clone()));
+        StepError::Fatal(error)
+    }
+
+    fn fatalize(&mut self, error: StepError) -> StepError {
+        match error {
+            StepError::PersistenceFailed | StepError::CompactionFailed => {
+                self.fatal(FatalError::Storage)
+            }
+            StepError::ApplyFailed | StepError::SnapshotFailed => {
+                self.fatal(FatalError::StateMachine)
+            }
+            error => error,
+        }
+    }
+
+    fn validate_completion(&self, id: EffectId, outcome: &EffectOutcome) -> Result<(), StepError> {
+        if id.generation() != self.config.generation() {
+            return Err(StepError::Input(InputError::StaleEffectGeneration));
+        }
+        if let Some(previous) = self.completed_outcomes.get(&id) {
+            return Err(StepError::Input(if previous == outcome {
+                InputError::AlreadyCompleted
+            } else {
+                InputError::ConflictingEffectOutcome
+            }));
+        }
+        if id.sequence() <= self.completed_frontier
+            || self.completed_sparse.contains(&id.sequence())
+        {
+            return Err(StepError::Input(InputError::AlreadyCompleted));
+        }
+        Ok(())
+    }
+
+    fn record_completion(&mut self, id: EffectId, outcome: EffectOutcome) {
+        self.completed_outcomes.insert(id, outcome);
+        self.completion_order.push_back(id);
+        if id.sequence() == self.completed_frontier.saturating_add(1) {
+            self.completed_frontier = id.sequence();
+            while self
+                .completed_sparse
+                .remove(&self.completed_frontier.saturating_add(1))
+            {
+                self.completed_frontier = self.completed_frontier.saturating_add(1);
+            }
+        } else {
+            self.completed_sparse.insert(id.sequence());
+        }
+        while self.completion_order.len() > self.config.completion_history() {
+            let expired = self
+                .completion_order
+                .pop_front()
+                .expect("history is nonempty");
+            self.completed_outcomes.remove(&expired);
         }
     }
 
@@ -1166,14 +1292,18 @@ impl<C> RaftCore<C> {
                         if *snapshot_id != receiver.metadata().id()
                             || *next_offset != receiver.next_offset()
                         {
-                            return Err(StepError::InvalidSnapshot);
+                            self.pending_chunk_store = Some(pending);
+                            return Err(StepError::Input(InputError::InvalidEffectOutcome));
                         }
                         if pending.done {
                             if !receiver.is_complete_and_valid() {
+                                self.pending_chunk_store = Some(pending);
                                 return Err(StepError::InvalidSnapshot);
                             }
-                            let snapshot_ref =
-                                snapshot_ref.clone().ok_or(StepError::InvalidSnapshot)?;
+                            let Some(snapshot_ref) = snapshot_ref.clone() else {
+                                self.pending_chunk_store = Some(pending);
+                                return Err(StepError::InvalidSnapshot);
+                            };
                             let record = receiver.record(snapshot_ref);
                             let persist_id = self.next_effect_id()?;
                             self.incoming_snapshot_state =
@@ -1684,12 +1814,14 @@ impl<C> RaftCore<C> {
                 && *offset == sender.offset() =>
             {
                 if bytes.len() > self.config.snapshot_chunk_bytes() {
-                    return Err(StepError::InvalidSnapshot);
+                    self.pending_snapshot_reads.insert(id, to);
+                    return Err(StepError::Input(InputError::InvalidEffectOutcome));
                 }
                 let metadata = sender.snapshot().metadata().clone();
-                sender
-                    .advance(bytes.len())
-                    .map_err(|_| StepError::InvalidSnapshot)?;
+                if sender.advance(bytes.len()).is_err() {
+                    self.pending_snapshot_reads.insert(id, to);
+                    return Err(StepError::Input(InputError::InvalidEffectOutcome));
+                }
                 effects.push(Effect::SendMessage {
                     to,
                     message: Message::InstallSnapshot {
@@ -1709,7 +1841,10 @@ impl<C> RaftCore<C> {
                 self.stopped = true;
                 Err(StepError::PersistenceFailed)
             }
-            _ => Err(StepError::Input(InputError::InvalidEffectOutcome)),
+            _ => {
+                self.pending_snapshot_reads.insert(id, to);
+                Err(StepError::Input(InputError::InvalidEffectOutcome))
+            }
         }
     }
 

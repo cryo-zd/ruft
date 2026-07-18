@@ -7,7 +7,7 @@ use std::ops::RangeInclusive;
 
 pub use entry::{Entry, EntryPayload};
 
-use crate::{LogError, LogIndex, RecoveredState, SnapshotRecord, Term};
+use crate::{InvariantViolation, LogError, LogIndex, RecoveredState, SnapshotRecord, Term};
 use unstable::Unstable;
 
 /// A validated log suffix together with its compacted snapshot boundary.
@@ -309,6 +309,12 @@ impl<C> RaftLog<C> {
     /// Returns the installed snapshot record, if any.
     pub const fn snapshot(&self) -> Option<&SnapshotRecord> {
         self.snapshot.as_ref()
+    }
+
+    /// Validates the continuity and term ordering of the current logical suffix.
+    pub(crate) fn validate(&self) -> Result<(), InvariantViolation> {
+        self.validate_continuity(&self.entries, self.first_index())
+            .map_err(InvariantViolation::Log)
     }
 
     /// Installs a received snapshot and retains the suffix only when its boundary matches.

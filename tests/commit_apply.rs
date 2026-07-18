@@ -204,7 +204,7 @@ fn quorum_commit_is_durable_before_ordered_apply_and_proposal_result() {
                 through: LogIndex::new(3)
             }
         }),
-        Err(ruft::StepError::Input(ruft::InputError::UnknownEffect))
+        Err(ruft::StepError::Input(ruft::InputError::AlreadyCompleted))
     ));
 }
 
@@ -296,7 +296,7 @@ fn apply_failure_stops_the_core() {
             id: apply_id,
             outcome: EffectOutcome::Failed
         }),
-        Err(ruft::StepError::ApplyFailed)
+        Err(ruft::StepError::Fatal(ruft::FatalError::StateMachine))
     ));
     assert!(core.status().is_stopped());
 }

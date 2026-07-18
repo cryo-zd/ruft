@@ -145,7 +145,7 @@ fn snapshot_body_and_compaction_failures_stop_the_core() {
             id: build_id,
             outcome: EffectOutcome::Failed
         }),
-        Err(ruft::StepError::SnapshotFailed)
+        Err(ruft::StepError::Fatal(ruft::FatalError::StateMachine))
     ));
     assert!(core.status().is_stopped());
 
@@ -180,7 +180,7 @@ fn snapshot_body_and_compaction_failures_stop_the_core() {
             id: compact_id,
             outcome: EffectOutcome::Failed
         }),
-        Err(ruft::StepError::CompactionFailed)
+        Err(ruft::StepError::Fatal(ruft::FatalError::Storage))
     ));
     assert!(core.status().is_stopped());
 }
