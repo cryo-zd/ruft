@@ -19,6 +19,10 @@ proptest = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = "0.10"
 
+[[bench]]
+name = "core"
+harness = false
+
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1"

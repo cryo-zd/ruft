@@ -1764,14 +1764,13 @@ impl<C> RaftCore<C> {
         if self.pending_snapshot_reads.values().any(|peer| *peer == to) {
             return Ok(());
         }
-        if !self.snapshot_senders.contains_key(&to) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.snapshot_senders.entry(to) {
             let snapshot = self
                 .log
                 .snapshot()
                 .cloned()
                 .ok_or(StepError::InvalidSnapshot)?;
-            self.snapshot_senders
-                .insert(to, SnapshotSender::new(snapshot));
+            entry.insert(SnapshotSender::new(snapshot));
         }
         let (snapshot, offset) = {
             let sender = self
