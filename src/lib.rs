@@ -1,8 +1,17 @@
 //! A deterministic, runtime-agnostic Raft consensus core.
 //!
 //! Ruft separates protocol state transitions from networking, storage, timers,
-//! and application state. This first module set defines the stable identifiers
-//! and validated configuration used by the rest of the implementation.
+//! and application state. The host drives [`RaftCore`] with [`Event`] values and
+//! executes each returned [`Effect`] before reporting its completion.
+//!
+//! Correctness-sensitive effects have explicit barriers: persistence must be
+//! atomic and durable before its completion, committed entries must be applied
+//! in order, and received snapshots must be installed before they are acknowledged.
+//! Storage or state-machine failure stops the running core; recover by validating
+//! durable state and constructing a new core with a new effect generation.
+//!
+//! Membership is fixed for the lifetime of a core. See the repository README and
+//! `examples/minimal_host.rs` for a complete in-memory host loop.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
