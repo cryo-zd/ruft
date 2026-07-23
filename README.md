@@ -1,72 +1,77 @@
 # Ruft
 
-Ruft is a deterministic, runtime-agnostic Raft consensus core for Rust. It owns
-protocol transitions and emits effects for the host to perform; it does not own
-timers, networking, storage, or the application state machine.
+A deterministic, runtime-agnostic [Raft] consensus core for Rust — it owns
+protocol transitions and emits **effects** for the host to perform. No timers,
+no networking, no storage engine, no async runtime.
 
-The current release implements fixed-membership Raft: PreVote leader election,
-CheckQuorum, durable log replication, pipelined follower progress, commit and
-ordered apply, quorum-confirmed ReadIndex, local snapshot compaction, streaming
-snapshot installation, and fail-stop fault handling. Cluster membership changes
-are intentionally out of scope.
-
-## Design
-
-A host serially calls `RaftCore::step` with an `Event` and executes the returned
-`Effect`s. Work that affects correctness is asynchronous from the core’s point
-of view: the host must report the matching `EffectCompleted` event only after
-that work has crossed its required durability or state-machine boundary.
-
-```text
-Event -> RaftCore::step -> Effects -> host executes work -> EffectCompleted
+```rust
+let mut core = RaftCore::new(config, recovered_state)?;
+for event in host_events {
+    let output = core.step(event)?;
+    for effect in output.effects {
+        host.execute(effect);          // persist, apply, send, snapshot, …
+    }
+}
 ```
 
-The core has no runtime, networking, codec, or storage dependency. Commands do
-not require `Clone`, serialization, or `Send` bounds.
+## Features
 
-## Minimal Host
+- **PreVote** — prevents partitioned nodes from disrupting active clusters
+- **CheckQuorum** — leader steps down when it loses contact with a majority
+- **ReadIndex** — linearizable reads without appending to the log
+- **Conflict-hint optimisation** — skips entire conflicting term ranges on rejection
+- **Pipelined replication** — bounded in-flight AppendEntries per follower
+- **Snapshot streaming** — chunked transfer with SHA-256 verification and idempotent retry
+- **Type-safe identifiers** — `NodeId`, `Term`, `LogIndex`, etc. are distinct newtypes
+- **Fail-stop safety** — storage or state-machine failure stops the core permanently
+- **Zero command bounds** — commands need not implement `Clone`, `Serialize`, or `Send`
 
-Run the in-memory demonstration with:
+Fixed-membership Raft only; dynamic membership changes are out of scope.
+
+## Quick Start
 
 ```bash
 cargo run --example minimal_host
 ```
 
-It elects a single-node leader, persists the required Raft state in a mock host,
-and commits one command. The example deliberately keeps its storage and state
-machine in memory; it is not a production storage adapter.
+The example boots a single-node cluster in memory, elects a leader, persists
+Raft state, and commits one command. It is deliberately minimal — a production
+host adds a real transport, storage, and state machine.
 
-## Host Contract
+## How It Works
 
-- Execute events serially for each `RaftCore` instance.
-- Persist every `PersistBatch` atomically and in issued order. Report `Persisted`
-  only after the selected durability boundary is reached.
-- Apply `Apply` entries in order and without gaps. Application commands should
-  be idempotent when replay could repeat an externally visible side effect.
-- Build and store snapshot bodies before reporting `SnapshotBuilt`; persist
-  snapshot metadata before compacting the log; install received snapshots before
-  acknowledging them to a leader.
-- Bind authenticated transport identity to `Envelope::from`, validate message
-  sizes before delivery, and discard network-send failures locally. Transport
-  failure is retryable; storage and state-machine failure must be completed as
-  `EffectOutcome::Failed` and stops the core.
-- Treat `Status::is_stopped()` as terminal for the running instance. Recover by
-  validating durable state, restoring the referenced snapshot into the state
-  machine, and constructing a new core with a new effect generation.
+The host drives the core in a serial event loop:
 
-Fixed membership is validated at construction and stored in snapshot metadata.
-No event changes the member set.
+```
+Event ──▶ RaftCore::step() ──▶ Vec<Effect> ──▶ host executes ──▶ EffectCompleted ──▶ …
+```
 
-## Reads and Snapshots
+- **Event** — a tick, an RPC, a proposal, a read request, or an effect completion.
+- **Effect** — a host-side task: `Persist`, `Apply`, `SendMessage`, `BuildSnapshot`, …
+- **EffectCompleted** — the host reports back after executing the effect.
 
-`ReadReady` is emitted only after a current-term leader has quorum confirmation
-and the local state machine has applied the read index. A read must therefore be
-served from state at or beyond `read_index`.
+Correctness-critical effects (`Persist`, `Apply`, snapshot operations) act as
+**asynchronous barriers** — the core will not advance past them until the host
+confirms completion.
 
-Snapshots are externally stored. The core coordinates metadata, opaque snapshot
-references, chunk bounds, checksums, persistence ordering, compaction, and
-installation, while the host owns body bytes and lifecycle cleanup.
+For a deep dive into the architecture, protocol walkthroughs, and design
+decisions, see **[Building a Runtime-Agnostic Raft Core](docs/building-a-runtime-agnostic-raft-core.md)**.
+
+## Host Contract (Summary)
+
+- Drive each `RaftCore` instance **serially** — one event at a time.
+- Persist every `PersistBatch` **atomically**; report `Persisted` only after the
+  durability boundary is reached.
+- Apply entries **in index order**, without gaps.
+- Bind authenticated transport identity to `Envelope::from`.
+- Treat `Status::is_stopped()` as terminal — recover by validating durable state
+  and constructing a new core with a fresh effect generation.
+
+Network failures are retryable (drop the send). Storage and state-machine
+failures are fatal — report `EffectOutcome::Failed` and the core stops.
 
 ## License
 
-Ruft is distributed under the [MIT License](LICENSE).
+[MIT](LICENSE)
+
+[Raft]: https://raft.github.io/raft.pdf
